@@ -11,11 +11,6 @@ cd FreeKV
 
 ### 2. Create the environment with uv
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you haven't already:
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
 Create a virtual environment and install all dependencies:
 ```bash
 uv venv --python 3.10
@@ -145,6 +140,9 @@ python source/pred.py --model qwen-2.5-chat-7b --dataset lgbench --max_gen 16384
 | `--corr` | None | Correction cosine-similarity threshold (e.g. 0.8–0.9) |
 | `--repeat_bsz` | 1 | Simulate batch size by repeating input |
 
+## Accuracy Evaluation
+
+For accuracy evaluation on LongBench2, LongGenBench, reasoning tasks, see [accuracy/README.md](accuracy/README.md).
 
 ## Acknowledgements
 
