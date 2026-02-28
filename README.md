@@ -101,7 +101,7 @@ sed -i '/^struct IOType<__nv_bfloat162, 4>/,+3s/^};$/};\n/' \
 ### 4. Build
 ```bash
 cd source
-uv pip install -e .
+uv pip install -e . --no-build-isolation
 ```
 
 ## Usage
