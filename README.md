@@ -85,6 +85,48 @@ cd source
 pip install -e .
 ```
 
+## Usage
+
+### Long Input (Gov Report Summarization)
+
+**ArkVale** (baseline recall):
+```bash
+python source/pred.py --model qwen-2.5-chat-7b --dataset gov_report --max_gen 512 --data_idx 0 --recall_impl arkvale
+```
+
+**FreeKV** (speculative retrieval + correction):
+```bash
+python source/pred.py --model qwen-2.5-chat-7b --dataset gov_report --max_gen 512 --data_idx 0 --recall_impl cuda_cpy --spec_ret --corr 0.8
+```
+
+### Long Generation (LongGenBench)
+
+**ArkVale**:
+```bash
+python source/pred.py --model qwen-2.5-chat-7b --dataset lgbench --max_gen 16384 --warmup 0 --data_idx 0 --recall_impl arkvale
+```
+
+**FreeKV**:
+```bash
+python source/pred.py --model qwen-2.5-chat-7b --dataset lgbench --max_gen 16384 --warmup 0 --data_idx 0 --recall_impl cuda_cpy --spec_ret --corr 0.9
+```
+
+### Key Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--model` | — | Model name (key in `config/model2path.json`) |
+| `--dataset` | — | `gov_report`, `lgbench`, or `AIME24` |
+| `--max_gen` | 8192 | Max new tokens to generate |
+| `--budget` | 2048 | Total KV cache token budget (sink + recent + retrieved) |
+| `--sink` | 512 | Number of sink tokens |
+| `--recent` | 512 | Number of recent tokens |
+| `--recall_impl` | `cuda_cpy` | Recall backend: `arkvale`, `torch_cpy`, or `cuda_cpy` |
+| `--spec_ret` | off | Enable speculative retrieval |
+| `--corr` | None | Correction cosine-similarity threshold (e.g. 0.8–0.9) |
+| `--repeat_bsz` | 1 | Simulate batch size by repeating input |
+
+
 ## Acknowledgements
 
 FreeKV is built upon [ArkVale](https://github.com/pku-liang/ArkVale) and [FlashInfer](https://github.com/flashinfer-ai/flashinfer). We thank the developers of these projects for their excellent work.

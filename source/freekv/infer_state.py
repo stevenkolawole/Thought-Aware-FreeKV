@@ -39,6 +39,7 @@ class InferState:
         spec_ret=False,
         thread_pool_size=2,
         n_recall_stream=2,
+        recall_impl=None,
         corr=None,
         corr_impl=None,
         corr_max_batch=16,
@@ -173,7 +174,8 @@ class InferState:
         self.group_size = group_size
         self.n_groups = n_groups
         
-        self.recall_impl = os.getenv("RECALL_IMPL") or "torch_cpy"
+        assert recall_impl in ("arkvale", "torch_cpy", "cuda_cpy"), f"Unknown recall_impl: {recall_impl}"
+        self.recall_impl = recall_impl
         self.recall_buf1 = torch.empty((0), **self._fp)
         self.recall_buf2 = torch.empty((0), **self._fp)
         if page_budgets[-1] is not None and cpu_layout == "HND":
@@ -188,7 +190,7 @@ class InferState:
                                 for _ in range(n_recall_stream)]
 
         self.spec_ret = spec_ret
-        self.corr_impl = corr_impl or os.getenv("CORR_IMPL", "torch")
+        self.corr_impl = corr_impl or os.getenv("CORR_IMPL", "managed_cuda")
         assert self.corr_impl in ("torch", "managed_cuda")
         self.corr_max_batch = corr_max_batch
         assert self.corr_max_batch > 0
@@ -204,7 +206,7 @@ class InferState:
                 self.corr_max_batch, self.n_kv_heads
             )
         if spec_ret:
-            assert self.recall_impl == "cuda_cpy" and cpu_layout == "HND"
+            assert self.recall_impl == "cuda_cpy" and cpu_layout == "HND", f"{self.recall_impl=} {cpu_layout=}"
             self.compute_stream = torch.cuda.Stream(self.device) 
             self.spec_ret_recall_status = [None] * n_layers
             self.spec_ret_recall_events = [
@@ -519,7 +521,7 @@ class InferState:
         impl = self.recall_impl
 
         torch.cuda.nvtx.range_push("recall")
-        if impl == "naive":
+        if impl == "arkvale":
             for i in range(kvc.batch_size):
                 for j in range(self.n_groups):
                     nr = rids[i, j, 0]
