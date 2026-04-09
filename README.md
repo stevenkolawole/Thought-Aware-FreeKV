@@ -15,7 +15,7 @@ direction changes abruptly.
 
 **Our goal is** to use thought-type classification to *predict* correction events before they happen, rather than detecting them after the fact.
 
-We need to reproduce FreeKV on AIME24 (old readme covers that) and also instrument by adding two logging hooks to log cosine sim at eahc step and log bytes transfereed per `recall`. See [Github Issue](https://github.com/stevenkolawole/Thought-Aware-FreeKV/issues) for details, then we want to make the minimal system changes that achieve our gaols.
+We need to reproduce FreeKV on AIME24 (old readme covers that) and also instrument by adding two logging hooks to log cosine sim at eahc step and log bytes transfereed per `recall` (see [Github Issue](https://github.com/stevenkolawole/Thought-Aware-FreeKV/issues) for details). Then we want to make the minimal system changes that achieve our goals.
 
 ### Use FreeKV's existing cosine similarity signal as the thought-type proxy
 
