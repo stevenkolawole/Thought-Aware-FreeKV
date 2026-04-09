@@ -1,19 +1,21 @@
 # Thought-Aware KV
 
-**Please see [old README](old_README.md) for installation and testing. 
+**Please see [old README](old_README.md) for installation and testing.**
 
 ## What we are doing
 
 FreeKV's speculative retrieval assumes adjacent decode-step query vectors are similar
 (cosine sim > 0.84 typically). This holds for long-input tasks, but on AIME24 (complex
 math reasoning), **43-52% of decode steps trigger correction** (query similarity drops
-below τ). Nearly half of all steps, meaning speculation can only go so far~~
+below τ). Nearly half of all steps, meaning speculation can only go so far!!
 
-ThinKV identifies *why*: reasoning models generate **thought transitions (T segments)**
+ThinKV identifies *why* this happens: reasoning models generate **thought transitions (T segments)**
 where the model backtracks or redirects, since this are the precise moments where query
 direction changes abruptly.
 
 **Our goal is** to use thought-type classification to *predict* correction events before they happen, rather than detecting them after the fact.
+
+We need to reproduce FreeKV on AIME24 (old readme covers that) and also instrument by adding two logging hooks to log cosine sim at eahc step and log bytes transfereed per `recall`. See [Github Issue](https://github.com/stevenkolawole/Thought-Aware-FreeKV/issues) for details, then we want to make the minimal system changes that achieve our gaols.
 
 ### Use FreeKV's existing cosine similarity signal as the thought-type proxy
 
@@ -37,8 +39,29 @@ So instead of a separate classifier, we can maitain a running average of cosine 
 
 ## File-by-File Breakdown
 
+I can walk us through specific files (if needed) during our meeting...
 
 ## Key Algorithms
+
+1. Sink + Window + Retrieved Strategy
+Every decode step, the KV budget is divided into:
+
+	- Sink pages (e.g., first 512 tokens): always kept since they are critical for attention patterns
+	- Window pages (e.g., last 512 tokens): sliding window for locality
+	- Retrieved pages: dynamically selected by scoring
+
+2. Digest Cache
+
+Instead of scoring full KV tensors, FreeKV stores max/min bounds per page (2× compression). `estimate_scores()` approximates relevance as `query x (max + min) / 2`. This lets the system score thousands of pages on-GPU in milliseconds.
+
+3. Speculative Retrieval + Correction
+
+	- Speculative: overlap the CPU->GPU data transfer for step N+1 with the attention computation of step N (using async CUDA streams + thread pool)
+	- Correction: before using speculatively fetched pages, compute cosine similarity between current and previous query. If the query changed significantly (below threshold), throw out the speculative fetch and do a synchronous re-fetch -- trading latency for correctness during abrupt query shifts
+
+4. Double-Buffered Recall
+
+The `cuda_cpy` backend uses two pinned-memory buffers alternately, so one buffer is being filled from CPU while the other is being read by the GPU kernel; this hides transfer latency.
 
 ## Summary of their Data Flow
 
