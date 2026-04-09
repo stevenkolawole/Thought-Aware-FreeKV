@@ -44,7 +44,8 @@ I can walk us through specific files (if needed) during our meeting...
 ## Key Algorithms
 
 1. Sink + Window + Retrieved Strategy
-Every decode step, the KV budget is divided into:
+
+	Every decode step, the KV budget is divided into:
 
 	- Sink pages (e.g., first 512 tokens): always kept since they are critical for attention patterns
 	- Window pages (e.g., last 512 tokens): sliding window for locality
@@ -52,7 +53,7 @@ Every decode step, the KV budget is divided into:
 
 2. Digest Cache
 
-Instead of scoring full KV tensors, FreeKV stores max/min bounds per page (2× compression). `estimate_scores()` approximates relevance as `query x (max + min) / 2`. This lets the system score thousands of pages on-GPU in milliseconds.
+	Instead of scoring full KV tensors, FreeKV stores max/min bounds per page (2× compression). `estimate_scores()` approximates relevance as `query x (max + min) / 2`. This lets the system score thousands of pages on-GPU in milliseconds.
 
 3. Speculative Retrieval + Correction
 
@@ -61,14 +62,14 @@ Instead of scoring full KV tensors, FreeKV stores max/min bounds per page (2× c
 
 4. Double-Buffered Recall
 
-The `cuda_cpy` backend uses two pinned-memory buffers alternately, so one buffer is being filled from CPU while the other is being read by the GPU kernel; this hides transfer latency.
+	The `cuda_cpy` backend uses two pinned-memory buffers alternately, so one buffer is being filled from CPU while the other is being read by the GPU kernel; this hides transfer latency.
 
 ## Summary of their Data Flow
 
 **During Prefill,**
 
-`QKV projection -> RoPE -> append to GPU cache -> backup to CPU -> build digest cache -> attention -> evict excess if budget is exceeded`
+	`QKV projection -> RoPE -> append to GPU cache -> backup to CPU -> build digest cache -> attention -> evict excess if budget is exceeded`
 
 **During Decode (speculative)**
 
-`Wait for previous recall events -> [optionally] correct if query has changed -> run attention on recalled pages -> launch next step's recall async in thread pull`
+	`Wait for previous recall events -> [optionally] correct if query has changed -> run attention on recalled pages -> launch next step's recall async in thread pull`
