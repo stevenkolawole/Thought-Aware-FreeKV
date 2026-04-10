@@ -34,7 +34,7 @@ So instead of a separate classifier, we can maitain a running average of cosine 
 
 **Layer 2:** Python Cache & Kernel Wrappers -- `kv_cache.py + kernels.py + utils.py`
 
-**C++/CUDA impl.:** `flashinfer_ops.h + *.cu + thread_pool.cpp`
+**Layer 3:** C++/CUDA impl.: `flashinfer_ops.h + *.cu + thread_pool.cpp`
 
 
 ## File-by-File Breakdown
@@ -68,8 +68,8 @@ I can walk us through specific files (if needed) during our meeting...
 
 **During Prefill,**
 
-	`QKV projection -> RoPE -> append to GPU cache -> backup to CPU -> build digest cache -> attention -> evict excess if budget is exceeded`
+`QKV projection -> RoPE -> append to GPU cache -> backup to CPU -> build digest cache -> attention -> evict excess if budget is exceeded`
 
 **During Decode (speculative)**
 
-	`Wait for previous recall events -> [optionally] correct if query has changed -> run attention on recalled pages -> launch next step's recall async in thread pull`
+`Wait for previous recall events -> [optionally] correct if query has changed -> run attention on recalled pages -> launch next step's recall async in thread pull`
