@@ -95,6 +95,7 @@ def parse_args(args=None):
     parser.add_argument("--max_gen", type=int, default=8192, help="Max number of new tokens to generate")
     parser.add_argument("--data_idx", type=int, default=None, help="Single data index to evaluate")
     parser.add_argument("--data_idx_to", type=int, default=None, help="Evaluate data from index 0 to this index (exclusive)")
+    parser.add_argument("--data_ids", type=str, default=None, help="Comma-separated list of problem IDs to evaluate (takes precedence over --data_idx / --data_idx_to)")
 
     parser.add_argument("--sink", type=int, default=512, help="Number of sink tokens to keep")
     parser.add_argument("--recent", type=int, default=512, help="Number of recent tokens to keep")
@@ -109,6 +110,7 @@ def parse_args(args=None):
                         choices=["arkvale", "torch_cpy", "cuda_cpy"], help="Recall implementation")
     parser.add_argument("--corr", type=float, default=None, help="Correction threshold (cosine similarity); None to disable")
     parser.add_argument("--warmup", type=int, default=2, help="Number of warmup generation rounds before timing")
+    parser.add_argument("--log_dir", type=str, default=None, help="Directory to write per-step instrumentation CSVs (corr_*.csv, recall_*.csv)")
 
     return parser.parse_args(args)
 
@@ -156,18 +158,20 @@ def load_model_and_tokenizer(path):
             n_recall_stream=args.n_recall_stream,
             recall_impl=args.recall_impl,
             corr=args.corr,
+            log_dir=args.log_dir,
         )
     else:
         assert not args.spec_ret
         infer_state = adapter.enable_offload(
-            model, 
-            dtype=dtype, 
-            device=dev, 
+            model,
+            dtype=dtype,
+            device=dev,
             page_size=page_size,
             page_budgets=None, # page_budgets=None means "full" (no eviction & recall)
             n_max_bytes=6 * (1 << 30),
             n_max_cpu_bytes=40 * (1 << 30),
             group_size=1,
+            log_dir=args.log_dir,
         )
 
     return model, tokenizer, eos_token_ids, infer_state
@@ -185,9 +189,15 @@ def get_pred(
     model_name,
     temperature,
     warmup,
+    infer_state=None,
 ):
     preds = []
-    for json_obj in tqdm(data):
+    for prob_idx, json_obj in enumerate(tqdm(data)):
+        if infer_state is not None and infer_state.log_dir is not None:
+            tag = json_obj.get("id", f"prob{prob_idx}")
+            # filesystem-safe tag
+            tag = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(tag))
+            infer_state.open_logs(tag=tag, max_steps=max_gen)
         if prompt_format is not None:
             prompt = prompt_format.format(**json_obj)
         else:
@@ -245,15 +255,36 @@ def get_pred(
             pred = tokenizer.decode(output[b], skip_special_tokens=True)
             pred_only_output = tokenizer.decode(output[b][len(input[b]):], skip_special_tokens=True)
             print(f"{BOLD}[Batch {b}] Output preview:{RESET} {simplify_text_preview(pred_only_output, max_tokens=100)}")
-            preds.append(
-                {
-                    "input:": prompt,
-                    "pred": pred,
-                    "answer": json_obj[answer_field_id] if answer_field_id is not None else "",
-                    "input_len": len(input[b]),
-                    "output_len": len(output[b]),
-                }
-            )
+            pred_record = {
+                "id": json_obj.get("id"),
+                "input:": prompt,
+                "pred": pred,
+                "answer": json_obj[answer_field_id] if answer_field_id is not None else "",
+                "input_len": len(input[b]),
+                "output_len": len(output[b]),
+            }
+            preds.append(pred_record)
+
+            # Token-level CSV + incremental preds.jsonl so a timeout cannot
+            # wipe completed-problem data.
+            if infer_state is not None and infer_state.log_dir is not None:
+                import csv as _csv
+                gen_ids = output[b][len(input[b]):].tolist()
+                toks_path = os.path.join(infer_state.log_dir, f"tokens_{tag}.csv")
+                with open(toks_path, "w", encoding="utf-8", newline="") as f:
+                    w = _csv.writer(f)
+                    w.writerow(["step_id", "token_id", "token_text"])
+                    for s_id, tid in enumerate(gen_ids):
+                        # decode one token at a time so text aligns exactly
+                        # to the step_id used in the corr/recall CSVs
+                        txt = tokenizer.decode([tid], skip_special_tokens=False)
+                        w.writerow([s_id, tid, txt])
+                preds_path = os.path.join(infer_state.log_dir, "preds.jsonl")
+                with open(preds_path, "a", encoding="utf-8") as f:
+                    json.dump(pred_record, f, ensure_ascii=False)
+                    f.write("\n")
+        if infer_state is not None and infer_state.log_dir is not None:
+            infer_state.close_logs()
     return preds
 
 
@@ -279,13 +310,25 @@ if __name__ == "__main__":
         ds_path = f"{ds_dir}/longgenbench.json"
     elif dataset == "AIME24":
         answer_field_id = "answer"
+        # The AIME24 data and prompt config actually live under accuracy/eval/reasoning/.
         ds_path = f"{ds_dir}/aime_2024.jsonl"
-        dataset2prompt = json.load(open("eval/o1/config/dataset2prompt.json", "r"))
+        if not os.path.exists(ds_path):
+            ds_path = "accuracy/eval/reasoning/datasets/aime24.jsonl"
+        prompt_cfg_path = "eval/o1/config/dataset2prompt.json"
+        if not os.path.exists(prompt_cfg_path):
+            prompt_cfg_path = "accuracy/eval/reasoning/config/dataset2prompt.json"
+        dataset2prompt = json.load(open(prompt_cfg_path, "r"))
         prompt_format = dataset2prompt[dataset]
 
     data = load_dataset("json", data_files=ds_path, split="train")
 
-    if args.data_idx is not None:
+    if args.data_ids is not None:
+        wanted = {s.strip() for s in args.data_ids.split(",") if s.strip()}
+        data = data.filter(lambda x: x.get("id") in wanted)
+        missing = wanted - {row["id"] for row in data}
+        if missing:
+            print(f"{YELLOW}[warn] requested ids not found in dataset: {sorted(missing)}{RESET}")
+    elif args.data_idx is not None:
         data = data.select(range(args.data_idx, args.data_idx+1))
     elif args.data_idx_to is not None:
         data = data.select(range(0, args.data_idx_to))
@@ -301,6 +344,7 @@ if __name__ == "__main__":
         model_name,
         args.temperature,
         args.warmup,
+        infer_state=infer_state,
     )
 
     out_dir = f"tmp_res/{model_name}"
@@ -311,6 +355,16 @@ if __name__ == "__main__":
         for pred in preds:
             json.dump(pred, f, ensure_ascii=False)
             f.write("\n")
+
+    if hasattr(infer_state, "get_corr_trigger_stats"):
+        try:
+            stats = infer_state.get_corr_trigger_stats()
+            print(f"{CYAN}{SEP}")
+            print(f"  Correction Stats: checks={stats['total_checks']}, "
+                  f"triggers={stats['total_triggers']}, rate={stats['total_rate']:.4f}")
+            print(f"{SEP}{RESET}")
+        except Exception:
+            pass
 
 
 # Original ArkVale

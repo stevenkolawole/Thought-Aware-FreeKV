@@ -8,6 +8,12 @@ class PosEncodingMode(Enum):
     ALIBI = 2
 
 
+class ThoughtType(Enum):
+    R = 0  # Reasoning: stable query direction
+    E = 1  # Execution: moderate drift
+    T = 2  # Transition: abrupt query shift ("Wait", "Hmm", etc.)
+
+
 class TensorLayout(Enum):
     NHD = 0
     HND = 1

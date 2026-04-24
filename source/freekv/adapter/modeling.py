@@ -166,6 +166,20 @@ def _freekv_attn_forward(
                     
                     to_corr = None
                     if state.corr is not None and state.last_step_q[cur_id] is not None:
+                        sim_mean_val = None
+                        if state.log_dir is not None:
+                            with torch.no_grad():
+                                # sim_raw: [bsz, q_len=1, n_q_heads]
+                                sim_raw = F.cosine_similarity(
+                                    state.last_step_q[cur_id], query_states, dim=-1
+                                )
+                                # One GPU->CPU transfer: reuse for scalar
+                                # mean log AND per-head sim cache. Cast to
+                                # float32 first — model tensors are bf16
+                                # and numpy has no native bf16 dtype.
+                                sim_cpu = sim_raw[0, 0].detach().float().cpu().numpy()
+                            sim_mean_val = float(sim_cpu.mean())
+                            state.log_per_head_sim(cur_id, sim_cpu)
                         torch.cuda.nvtx.range_push("cos")
                         if FORCE_CORR_RATE is not None:
                             to_corr_src = _force_to_corr[:bsz, :self.num_key_value_heads]
@@ -205,6 +219,11 @@ def _freekv_attn_forward(
                         state.corr_checks[cur_id] += 1
                         if need_corr:
                             state.corr_triggers[cur_id] += 1
+                        if state.log_dir is not None and sim_mean_val is not None:
+                            if cur_id == 0:
+                                state.update_thought_type(sim_mean_val)
+                            state.log_corr(cur_id, sim_mean_val, need_corr)
+                        if need_corr:
                             eids, rids = state.estimate_select(cur_id, query_states)
                             state.recall(cur_id, eids, rids, blocking=True, need_recall_corr=to_corr)
                         else:

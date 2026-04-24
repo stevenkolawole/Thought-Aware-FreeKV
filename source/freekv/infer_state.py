@@ -8,6 +8,7 @@ from torch import Tensor
 from .kv_cache import KvPool, KvCache
 from . import kernels
 from . import utils
+from .utils import ThoughtType
 import atexit
 
 Digest = Tuple[Tensor, Tensor]
@@ -43,6 +44,10 @@ class InferState:
         corr=None,
         corr_impl=None,
         corr_max_batch=16,
+        log_dir=None,
+        thought_ema_alpha=0.1,
+        thought_tau_r=0.84,
+        thought_tau_t=0.6,
         **kwargs,
     ) -> None:
         self.n_layers = n_layers
@@ -230,7 +235,129 @@ class InferState:
         self.sel_stat_ms = []
         self.corr_checks = [0] * n_layers
         self.corr_triggers = [0] * n_layers
-    
+
+        # --- Issue #1: instrumentation ---
+        self.log_dir = log_dir
+        self.step_id = -1  # first decode step becomes 0
+        self._corr_log_fh = None
+        self._recall_log_fh = None
+        self._per_head_sim_buffer = None
+        self._per_head_sim_tag = None
+        # per-recalled-page byte size: 2 (K+V) * page_size * group_size * head_dim * itemsize
+        self._recall_bytes_per_page = (
+            2 * page_size * self.group_size * head_dim * dtype.itemsize
+        )
+
+        # --- Issue #2: EMA thought-type tracker ---
+        self.thought_ema_alpha = thought_ema_alpha
+        self.thought_tau_r = thought_tau_r
+        self.thought_tau_t = thought_tau_t
+        self.sim_ema = 1.0
+        self.current_thought_type = ThoughtType.R.value
+
+        # last_step_q is also used for logging when corr/spec_ret are off,
+        # so allocate it unconditionally when a log_dir is set.
+        if self.log_dir is not None and not hasattr(self, "last_step_q"):
+            self.last_step_q = [None] * n_layers
+
+    def open_logs(self, tag: str = "run", max_steps: int | None = None):
+        """Open CSV log files + per-head sim buffer. Call at start of each problem.
+
+        If max_steps is given, also allocates a dense per-head-sim buffer of
+        shape [max_steps, n_layers, n_q_heads] (filled with NaN). Each call
+        to log_per_head_sim writes one layer's 1-D slice. On close_logs, the
+        trimmed buffer is saved as `sims_<tag>.npz`.
+        """
+        if self.log_dir is None:
+            return
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.close_logs()
+        corr_path = os.path.join(self.log_dir, f"corr_{tag}.csv")
+        recall_path = os.path.join(self.log_dir, f"recall_{tag}.csv")
+        self._corr_log_fh = open(corr_path, "w", buffering=1)
+        self._recall_log_fh = open(recall_path, "w", buffering=1)
+        self._corr_log_fh.write("step_id,layer_id,cos_sim,need_corr,thought_type,sim_ema\n")
+        self._recall_log_fh.write("step_id,layer_id,n_pages,bytes\n")
+
+        if max_steps is not None and max_steps > 0:
+            import numpy as _np
+            self._per_head_sim_buffer = _np.full(
+                (max_steps, self.n_layers, self.n_qo_heads),
+                _np.nan, dtype=_np.float32,
+            )
+            self._per_head_sim_tag = tag
+        else:
+            self._per_head_sim_buffer = None
+            self._per_head_sim_tag = None
+
+    def close_logs(self):
+        for attr in ("_corr_log_fh", "_recall_log_fh"):
+            fh = getattr(self, attr, None)
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+        buf = getattr(self, "_per_head_sim_buffer", None)
+        tag = getattr(self, "_per_head_sim_tag", None)
+        if buf is not None and tag is not None and self.log_dir is not None:
+            import numpy as _np
+            # Trim trailing steps we never reached (all-NaN rows).
+            valid = ~_np.all(_np.isnan(buf), axis=(1, 2))
+            if valid.any():
+                last = int(_np.where(valid)[0].max()) + 1
+                buf = buf[:last]
+            else:
+                buf = buf[:0]
+            path = os.path.join(self.log_dir, f"sims_{tag}.npz")
+            _np.savez_compressed(path, sim=buf)
+            self._per_head_sim_buffer = None
+            self._per_head_sim_tag = None
+
+    def log_per_head_sim(self, layer_idx: int, sim_per_head):
+        """sim_per_head: 1-D numpy array of length n_q_heads (for bsz=1)."""
+        buf = getattr(self, "_per_head_sim_buffer", None)
+        if buf is None:
+            return
+        s = self.step_id
+        if 0 <= s < buf.shape[0]:
+            buf[s, layer_idx] = sim_per_head
+
+    def log_corr(self, layer_idx: int, cos_sim: float, need_corr: bool):
+        if self._corr_log_fh is None:
+            return
+        self._corr_log_fh.write(
+            f"{self.step_id},{layer_idx},{cos_sim:.6f},{int(bool(need_corr))},"
+            f"{self.current_thought_type},{self.sim_ema:.6f}\n"
+        )
+
+    def log_recall(self, layer_idx: int, n_pages: int):
+        if self._recall_log_fh is None:
+            return
+        bytes_transferred = int(n_pages) * self._recall_bytes_per_page
+        self._recall_log_fh.write(
+            f"{self.step_id},{layer_idx},{int(n_pages)},{bytes_transferred}\n"
+        )
+
+    def update_thought_type(self, cos_sim: float) -> int:
+        """Update EMA of cosine sim and classify the current decode step.
+
+        R (reasoning) = stable query direction, sim_ema >= tau_r
+        T (transition) = abrupt drop, sim_ema < tau_t
+        E (execution) = in between
+        """
+        alpha = self.thought_ema_alpha
+        self.sim_ema = (1.0 - alpha) * self.sim_ema + alpha * float(cos_sim)
+        if self.sim_ema >= self.thought_tau_r:
+            self.current_thought_type = ThoughtType.R.value
+        elif self.sim_ema < self.thought_tau_t:
+            self.current_thought_type = ThoughtType.T.value
+        else:
+            self.current_thought_type = ThoughtType.E.value
+        return self.current_thought_type
+
     def _shutdown_cpp_pool(self):
         try:
             kernels.shutdown_recall_thread_pool()
@@ -433,8 +560,13 @@ class InferState:
 
     def begin_forward(self, bsz, q_len):
         if q_len > 1:
+            # new prompt → reset step counter and thought tracker
+            self.step_id = -1
+            self.sim_ema = 1.0
+            self.current_thought_type = ThoughtType.R.value
             self._prepare_prefill(bsz, q_len)
         else:
+            self.step_id += 1
             self._prepare_decode(bsz)
 
     def end_forward(self, bsz, q_len):
@@ -519,6 +651,10 @@ class InferState:
         eids = eids.reshape(bsz, ng, -1)
         rids = rids.reshape(bsz, ng, -1)
         impl = self.recall_impl
+
+        if self._recall_log_fh is not None:
+            total_pages = int(rids[:, :, 0].sum().item())
+            self.log_recall(layer_idx, total_pages)
 
         torch.cuda.nvtx.range_push("recall")
         if impl == "arkvale":
