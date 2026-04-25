@@ -40,6 +40,25 @@ analysis/
 **Do not mix these numbers with `verify_dips/`** — different problem set,
 different purpose.
 
+## `full_aime/` — paper-config sweep on the full benchmark
+
+**Setup:**
+- All AIME24 problems with the paper's reasoning config:
+  `--max_gen 16384 --budget 2048 --sink 512 --recent 512 --corr 0.9 --spec_ret`
+  (Section 5.2 of arXiv:2505.13109 specifies max_gen = 16K).
+- Logging includes per-(step, layer, q_head) cosine sim cached as
+  `sims_<pid>.npz` (28 problems present; 2 problems were not reached:
+  `2024-I-5`, `2024-II-13`).
+
+**Headline at τ=0.9, mean across 28 problems:**
+- `need_corr` trigger rate (any of 8 kv groups < τ): **90.14%** (std 1.74%)
+- Per-q-head rate (single q-head < τ): **55.74%** (std 2.91%)
+- Per-kv-head rate (single kv-head < τ): **58.90%** (std 3.23%)
+
+The paper's claim of 43–52% lands as a per-head rate; our measurement is
+slightly higher, consistent with what we saw on smaller subsets.
+Cross-problem variance is remarkably small.
+
 ## `verify_dips/` — what this run was and what it asks
 
 **Setup:**
