@@ -5,6 +5,12 @@ set(CMAKE_CUDA_ARCHITECTURES native)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
+find_package(CUDAToolkit REQUIRED)
+
+if(NOT TARGET CUDA::nvToolsExt)
+    add_library(CUDA::nvToolsExt INTERFACE IMPORTED GLOBAL)
+endif()
+
 find_package(Torch REQUIRED)
 find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
 

@@ -8,6 +8,9 @@ from torch import Tensor
 from .kv_cache import KvPool, KvCache
 from . import kernels
 from . import utils
+from .logger import RunLogger
+from .thought_classifier import ThoughtClassifier
+from .utils import ThoughtType
 import atexit
 
 Digest = Tuple[Tensor, Tensor]
@@ -43,6 +46,13 @@ class InferState:
         corr=None,
         corr_impl=None,
         corr_max_batch=16,
+        log_dir=None,
+        run_tag="",
+        ema_alpha=0.1,
+        r_threshold=0.92,
+        t_threshold=0.75,
+        segment_window=16,
+        classifier_layer=None,
         **kwargs,
     ) -> None:
         self.n_layers = n_layers
@@ -230,12 +240,47 @@ class InferState:
         self.sel_stat_ms = []
         self.corr_checks = [0] * n_layers
         self.corr_triggers = [0] * n_layers
+
+        self.logger = RunLogger(log_dir, run_tag)
+        self.prompt_id = 0
+        self.step_id = -1
+        self.is_warmup = False
+        atexit.register(self.logger.close)
+
+        self.thought = ThoughtClassifier(
+            ema_alpha=ema_alpha,
+            r_threshold=r_threshold,
+            t_threshold=t_threshold,
+            segment_window=segment_window,
+        )
+        self.classifier_layer = (
+            classifier_layer if classifier_layer is not None else n_layers // 2
+        )
     
     def _shutdown_cpp_pool(self):
         try:
             kernels.shutdown_recall_thread_pool()
         except Exception as e:
             raise RuntimeError("cannot shutdown thread pool") from e
+
+    def _log_recall(self, layer_idx: int, rids_3d: Tensor, kind: str) -> None:
+        if not self.logger.enabled or self.is_warmup:
+            return
+        num_pages = int(rids_3d[..., 0].sum().item())
+        if num_pages == 0:
+            return
+        bytes_per_page = (
+            2 * self.page_size * self.group_size * self.head_dim
+            * self.dtype.itemsize
+        )
+        self.logger.recall.write({
+            "prompt_id": self.prompt_id,
+            "step_id": self.step_id,
+            "layer_id": layer_idx,
+            "recall_kind": kind,
+            "recall_num_pages": num_pages,
+            "recall_bytes": num_pages * bytes_per_page,
+        })
 
 
     def get_corr_trigger_stats(self):
@@ -434,8 +479,11 @@ class InferState:
     def begin_forward(self, bsz, q_len):
         if q_len > 1:
             self._prepare_prefill(bsz, q_len)
+            self.step_id = -1
+            self.thought.reset()
         else:
             self._prepare_decode(bsz)
+            self.step_id += 1
 
     def end_forward(self, bsz, q_len):
         if q_len > 1:
@@ -504,10 +552,10 @@ class InferState:
         )
         return eids, rids
 
-    def recall(self, layer_idx: int, 
-               eids: Tensor, rids: Tensor, 
+    def recall(self, layer_idx: int,
+               eids: Tensor, rids: Tensor,
                blocking=True,
-               recall_evt1=None, 
+               recall_evt1=None,
                recall_evt2=None,
                need_recall_corr=None,):
         nw = self.n_win_pages
@@ -519,6 +567,8 @@ class InferState:
         eids = eids.reshape(bsz, ng, -1)
         rids = rids.reshape(bsz, ng, -1)
         impl = self.recall_impl
+
+        self._log_recall(layer_idx, rids, "blocking" if blocking else "correction")
 
         torch.cuda.nvtx.range_push("recall")
         if impl == "arkvale":
@@ -619,11 +669,16 @@ class InferState:
             # for recall
             cpu_kvc.c2p, cpu_kvc.buffer,
             kvc.buffer,
-            ng, gs, ns, nw, 
+            ng, gs, ns, nw,
             self.recall_buf1, self.recall_buf2,
             recall_stream1.cuda_stream, recall_stream2.cuda_stream,
             recall_evt1.cuda_event, recall_evt2.cuda_event
         )
+
+        if self.logger.enabled and not self.is_warmup:
+            recall_evt2.synchronize()
+            rids_view = rids.reshape(bsz, ng, -1)
+            self._log_recall(layer_idx, rids_view, "async_pool")
 
     def prefill_backup_pages(self, layer_idx: int):
         kvc = self.kv_caches[layer_idx]

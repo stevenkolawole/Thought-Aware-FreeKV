@@ -225,6 +225,43 @@ def _freekv_attn_forward(
                                      recall_evt1=recall_evt1, recall_evt2=recall_evt2,
                                      need_recall_corr=to_corr)
 
+                    cos_for_log = float("nan")
+                    if (
+                        state.logger.enabled and not state.is_warmup
+                    ) or cur_id == state.classifier_layer:
+                        prev_q = state.last_step_q[cur_id]
+                        if prev_q is not None:
+                            with torch.no_grad():
+                                cos_for_log = float(F.cosine_similarity(
+                                    prev_q, query_states, dim=-1
+                                ).mean().item())
+
+                    if cur_id == state.classifier_layer:
+                        state.thought.update(cos_for_log, state.step_id)
+
+                    if state.logger.enabled and not state.is_warmup:
+                        n_corr_heads = 0
+                        if state.corr is not None and to_corr is not None:
+                            n_corr_heads = int(to_corr.sum().item())
+                        state.logger.decode.write({
+                            "prompt_id": state.prompt_id,
+                            "step_id": state.step_id,
+                            "layer_id": cur_id,
+                            "q_len": q_len,
+                            "cos_sim": cos_for_log,
+                            "correction_triggered": bool(
+                                state.corr is not None and to_corr is not None
+                            ),
+                            "num_corr_heads": n_corr_heads,
+                            "ema_sim": (
+                                state.thought.ema_sim
+                                if state.thought.ema_sim is not None
+                                else float("nan")
+                            ),
+                            "thought_type": int(state.thought.current_type),
+                            "segment_id": state.thought.segment_id,
+                        })
+
                     if state.corr is not None:
                         state.last_step_q[cur_id] = query_states
                 else:

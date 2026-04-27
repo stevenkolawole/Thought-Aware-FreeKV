@@ -109,6 +109,13 @@ def parse_args(args=None):
                         choices=["arkvale", "torch_cpy", "cuda_cpy"], help="Recall implementation")
     parser.add_argument("--corr", type=float, default=None, help="Correction threshold (cosine similarity); None to disable")
     parser.add_argument("--warmup", type=int, default=2, help="Number of warmup generation rounds before timing")
+    parser.add_argument("--log_dir", type=str, default=None, help="If set, write decode/recall CSV logs + meta/gen JSON here")
+    parser.add_argument("--run_tag", type=str, default="", help="Tag identifying the run config (e.g. full_kv | freekv | thoughtfetch)")
+    parser.add_argument("--ema_alpha", type=float, default=0.1, help="EMA smoothing factor for cos-sim trajectory classifier")
+    parser.add_argument("--r_threshold", type=float, default=0.92, help="EMA cos-sim above this is classified as R (steady)")
+    parser.add_argument("--t_threshold", type=float, default=0.75, help="EMA cos-sim below this is classified as T (transition)")
+    parser.add_argument("--segment_window", type=int, default=16, help="Re-evaluate segment label every N decode steps")
+    parser.add_argument("--classifier_layer", type=int, default=None, help="Which transformer layer's cos-sim drives the classifier (default: middle layer)")
 
     return parser.parse_args(args)
 
@@ -139,9 +146,9 @@ def load_model_and_tokenizer(path):
     print(f"{SEP}{RESET}\n")
     if token_budgets > 0:
         infer_state = adapter.enable_offload(
-            model, 
-            dtype=dtype, 
-            device=dev, 
+            model,
+            dtype=dtype,
+            device=dev,
             page_size=page_size,
             page_budgets=page_budgets,
             page_topks=page_budgets-1,
@@ -156,18 +163,33 @@ def load_model_and_tokenizer(path):
             n_recall_stream=args.n_recall_stream,
             recall_impl=args.recall_impl,
             corr=args.corr,
+            log_dir=args.log_dir,
+            run_tag=args.run_tag,
+            ema_alpha=args.ema_alpha,
+            r_threshold=args.r_threshold,
+            t_threshold=args.t_threshold,
+            segment_window=args.segment_window,
+            classifier_layer=args.classifier_layer,
         )
     else:
         assert not args.spec_ret
         infer_state = adapter.enable_offload(
-            model, 
-            dtype=dtype, 
-            device=dev, 
+            model,
+            dtype=dtype,
+            device=dev,
             page_size=page_size,
             page_budgets=None, # page_budgets=None means "full" (no eviction & recall)
             n_max_bytes=6 * (1 << 30),
-            n_max_cpu_bytes=40 * (1 << 30),
+            n_max_cpu_bytes=1 * (1 << 30),  # CPU pool unused when page_budgets=None
             group_size=1,
+            recall_impl=args.recall_impl,
+            log_dir=args.log_dir,
+            run_tag=args.run_tag,
+            ema_alpha=args.ema_alpha,
+            r_threshold=args.r_threshold,
+            t_threshold=args.t_threshold,
+            segment_window=args.segment_window,
+            classifier_layer=args.classifier_layer,
         )
 
     return model, tokenizer, eos_token_ids, infer_state
@@ -185,9 +207,10 @@ def get_pred(
     model_name,
     temperature,
     warmup,
+    infer_state=None,
 ):
     preds = []
-    for json_obj in tqdm(data):
+    for prompt_idx, json_obj in enumerate(tqdm(data)):
         if prompt_format is not None:
             prompt = prompt_format.format(**json_obj)
         else:
@@ -216,13 +239,19 @@ def get_pred(
         with torch.no_grad():
             if warmup > 0:
                 print(f"{YELLOW}[Warmup] Running {warmup} warmup round(s)...{RESET}")
+                if infer_state is not None:
+                    infer_state.is_warmup = True
                 for _ in range(warmup):
                     _ = generate_once(
                         model, input, max_gen, temperature, eos_token_ids, tokenizer.eos_token_id
                     )
+                if infer_state is not None:
+                    infer_state.is_warmup = False
                 print(f"{YELLOW}[Warmup] Done.{RESET}")
                 model.tbt_stat_ms.clear()
 
+            if infer_state is not None:
+                infer_state.prompt_id = prompt_idx
             st = time.perf_counter()
             output = generate_once(
                 model, input, max_gen, temperature, eos_token_ids, tokenizer.eos_token_id
@@ -245,15 +274,26 @@ def get_pred(
             pred = tokenizer.decode(output[b], skip_special_tokens=True)
             pred_only_output = tokenizer.decode(output[b][len(input[b]):], skip_special_tokens=True)
             print(f"{BOLD}[Batch {b}] Output preview:{RESET} {simplify_text_preview(pred_only_output, max_tokens=100)}")
-            preds.append(
-                {
-                    "input:": prompt,
-                    "pred": pred,
-                    "answer": json_obj[answer_field_id] if answer_field_id is not None else "",
-                    "input_len": len(input[b]),
-                    "output_len": len(output[b]),
-                }
-            )
+            entry = {
+                "prompt_id": prompt_idx,
+                "batch_idx": b,
+                "input": prompt,
+                "pred": pred,
+                "pred_only_output": pred_only_output,
+                "answer": json_obj[answer_field_id] if answer_field_id is not None else "",
+                "input_len": len(input[b]),
+                "output_len": len(output[b]),
+                "gen_tokens": gen_token[b],
+                "wall_time_s": ed - st,
+                "avg_tbt_ms": avg_tbt,
+                "decode_time_ms": sum(decode_ms),
+            }
+            preds.append({"input:": prompt, "pred": pred,
+                           "answer": entry["answer"],
+                           "input_len": entry["input_len"],
+                           "output_len": entry["output_len"]})
+            if infer_state is not None and infer_state.logger.enabled:
+                infer_state.logger.append_gen(entry)
     return preds
 
 
@@ -283,12 +323,42 @@ if __name__ == "__main__":
         dataset2prompt = json.load(open("eval/o1/config/dataset2prompt.json", "r"))
         prompt_format = dataset2prompt[dataset]
 
-    data = load_dataset("json", data_files=ds_path, split="train")
+    with open(ds_path, "r") as f:
+        if ds_path.endswith(".jsonl"):
+            records = [json.loads(line) for line in f if line.strip()]
+        else:
+            records = json.load(f)
+            if not isinstance(records, list):
+                records = [records]
+    from datasets import Dataset
+    data = Dataset.from_list(records)
 
     if args.data_idx is not None:
         data = data.select(range(args.data_idx, args.data_idx+1))
     elif args.data_idx_to is not None:
         data = data.select(range(0, args.data_idx_to))
+
+    if infer_state is not None and infer_state.logger.enabled:
+        try:
+            import subprocess
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__) or "."
+            ).decode().strip()
+        except Exception:
+            git_commit = None
+        infer_state.logger.write_meta({
+            "run_tag": args.run_tag,
+            "args": vars(args),
+            "model_name": model_name,
+            "model_path": model2path[model_name],
+            "dataset": dataset,
+            "n_prompts": len(data),
+            "git_commit": git_commit,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "gpu": torch.cuda.get_device_name(0),
+            "torch_version": torch.__version__,
+        })
+
     preds = get_pred(
         model,
         tokenizer,
@@ -301,7 +371,11 @@ if __name__ == "__main__":
         model_name,
         args.temperature,
         args.warmup,
+        infer_state=infer_state,
     )
+
+    if infer_state is not None:
+        infer_state.logger.close()
 
     out_dir = f"tmp_res/{model_name}"
     if not os.path.exists(out_dir):

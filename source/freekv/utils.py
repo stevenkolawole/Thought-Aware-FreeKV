@@ -1,5 +1,5 @@
 import torch
-from enum import Enum
+from enum import Enum, IntEnum
 
 
 class PosEncodingMode(Enum):
@@ -11,6 +11,12 @@ class PosEncodingMode(Enum):
 class TensorLayout(Enum):
     NHD = 0
     HND = 1
+
+
+class ThoughtType(IntEnum):
+    R = 0  # Reasoning: steady-state, high sustained cos-sim
+    E = 1  # Execution: mild drift
+    T = 2  # Transition: sustained drift (backtracking)
 
 
 def expand_5d(x: torch.Tensor, kv_layout: str):
