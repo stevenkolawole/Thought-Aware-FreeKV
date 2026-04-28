@@ -228,6 +228,17 @@ def get_pred(
             input = chat_prompt
         prompt_length = input.shape[-1]
         print(f"{CYAN}[Input] prompt_length={prompt_length}, dtype={input.dtype}, device={input.device}{RESET}")
+        # FreeKV's digest-cache prefill needs q_len > page_size (the assertion
+        # is in InferState._prepare_prefill). Skip short prompts so the whole
+        # eval loop doesn't crash.
+        if prompt_length <= args.page_size:
+            print(f"{YELLOW}[skip] prompt_length={prompt_length} <= page_size="
+                  f"{args.page_size}; FreeKV requires more tokens for digest "
+                  f"cache. Problem id={json_obj.get('id') or json_obj.get('unique_id')}"
+                  f"{RESET}")
+            if infer_state is not None and infer_state.log_dir is not None:
+                infer_state.close_logs()
+            continue
         input = input.repeat(args.repeat_bsz, 1)
         with torch.no_grad():
             if warmup > 0:
@@ -346,8 +357,11 @@ if __name__ == "__main__":
 
     if args.data_ids is not None:
         wanted = {s.strip() for s in args.data_ids.split(",") if s.strip()}
-        data = data.filter(lambda x: x.get("id") in wanted)
-        missing = wanted - {row["id"] for row in data}
+        data = data.filter(
+            lambda x: x.get("id") in wanted or x.get("unique_id") in wanted
+        )
+        present = {row.get("id") for row in data} | {row.get("unique_id") for row in data}
+        missing = wanted - present
         if missing:
             print(f"{YELLOW}[warn] requested ids not found in dataset: {sorted(missing)}{RESET}")
     elif args.data_idx is not None:

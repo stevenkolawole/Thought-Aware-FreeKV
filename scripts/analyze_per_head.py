@@ -72,10 +72,15 @@ def load_problem(log_dir: Path, pid: str):
     return {"pid": pid, "sim": sim, "corr": corr, "tok": tok}
 
 
-def aggregate_stats(sim: np.ndarray) -> dict:
-    """Return flat per-(step, layer) numpy arrays of the derived statistics."""
+def aggregate_stats(sim: np.ndarray) -> dict | None:
+    """Return flat per-(step, layer) numpy arrays of the derived statistics.
+    Returns None if there's no valid (non-NaN) data."""
     # sim: [N, 32, 32]
+    if sim.size == 0:
+        return None
     valid = ~np.isnan(sim[:, 0, 0])          # [N] rows where sim was logged
+    if not valid.any():
+        return None
     sub = sim[valid]                          # [Nv, 32, 32]
 
     q_mean = sub.mean(axis=-1)               # [Nv, 32]   mean over 32 q heads
@@ -303,6 +308,9 @@ def main():
               f"nan_rows={int(np.isnan(sim[:,0,0]).sum()):,}")
 
         agg = aggregate_stats(sim)
+        if agg is None:
+            print(f"  [skip {pid}] no valid sim rows (problem was skipped or empty)")
+            continue
         n_valid = int(agg["valid_mask"].sum())
         n_trans = int(prob["tok"]["is_transition"].sum())
 

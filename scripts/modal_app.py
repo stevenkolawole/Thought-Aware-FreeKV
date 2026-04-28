@@ -174,6 +174,83 @@ def run_pred_1h(pred_args: list[str], log_subdir: str | None = None) -> int:
     return _run_pred_impl(pred_args, log_subdir)
 
 
+@app.function(timeout=60 * 60 * 12, **_RUN_PRED_FN_KW)
+def run_pred_per_problem(
+    pred_args: list[str],
+    log_subdir: str,
+    dataset_path: str,
+    id_field: str = "unique_id",
+) -> int:
+    """Run pred.py SEPARATELY per problem to avoid cross-problem state leaks.
+
+    Each problem runs in its own Python subprocess: fresh InferState, fresh
+    CUDA context, fresh JIT-compiled kernels. The container persists so the
+    image and HF cache stay warm. Per-problem overhead ~30s (model load +
+    flashinfer rope JIT). Worth it for stability on long sweeps.
+
+    pred_args should NOT include --data_ids or --log_dir; we set those.
+    """
+    import subprocess, json
+    os.chdir(REMOTE_ROOT)
+
+    log_path = f"/logs/{log_subdir}"
+    os.makedirs(log_path, exist_ok=True)
+
+    # Resolve dataset path relative to REMOTE_ROOT if not absolute
+    ds_full = (
+        dataset_path if os.path.isabs(dataset_path)
+        else os.path.join(REMOTE_ROOT, dataset_path)
+    )
+    ids: list[str] = []
+    with open(ds_full) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            pid = row.get(id_field) or row.get("id")
+            if pid:
+                ids.append(pid)
+    print(f"[modal] running {len(ids)} problems individually under {log_subdir}/", flush=True)
+
+    def _safe_tag(pid: str) -> str:
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in pid)
+
+    def _already_done(pid: str) -> bool:
+        # A problem is considered done if its sims_*.npz exists (sims are
+        # written at close_logs which only happens after generation completes
+        # OR after a clean skip; either way the problem won't restart cleanly).
+        tag = _safe_tag(pid)
+        sims_path = os.path.join(log_path, f"sims_{tag}.npz")
+        return os.path.exists(sims_path)
+
+    overall_rc = 0
+    n_skip_resume = 0
+    for i, pid in enumerate(ids):
+        if _already_done(pid):
+            n_skip_resume += 1
+            print(f"[modal {i+1}/{len(ids)}] {pid} — already done, resuming", flush=True)
+            continue
+        cmd = [
+            "python", "source/pred.py",
+            *pred_args,
+            "--data_ids", pid,
+            "--log_dir", log_path,
+        ]
+        print(f"[modal {i+1}/{len(ids)}] {pid}", flush=True)
+        proc = subprocess.run(cmd)
+        rc = proc.returncode
+        if rc != 0:
+            print(f"[modal] problem {pid} returned {rc}; continuing", flush=True)
+            overall_rc = max(overall_rc, rc)
+        # Commit logs after each problem so partial progress survives any
+        # later subprocess failure.
+        logs_vol.commit()
+    if n_skip_resume:
+        print(f"[modal] resumed by skipping {n_skip_resume} already-done problems", flush=True)
+    return overall_rc
+
+
 @app.function(
     image=image,
     volumes={"/logs": logs_vol},
@@ -292,6 +369,61 @@ def profile_aime():
     print(f"[profile_aime] returned {rc}")
     print("[profile_aime] logs on volume:")
     for p in ls_logs.remote("profile_aime"):
+        print(f"  {p}")
+
+
+@app.local_entrypoint()
+def math50_test_crash():
+    """Run JUST the problem that crashed earlier (test/prealgebra/1139.json)
+    with the CUDA event-pool fix. If this completes without a CUDA illegal
+    memory access, the fix is good and we can run full math50.
+    Uses run_pred_1h (1h timeout) for blast-radius bounding."""
+    args = [
+        "--model", "ds-r1-llama-8b",
+        "--dataset", "MATH50",
+        "--max_gen", "16384",
+        "--data_ids", "test/prealgebra/1139.json",
+        "--budget", "2048",
+        "--sink", "512",
+        "--recent", "512",
+        "--recall_impl", "cuda_cpy",
+        "--spec_ret",
+        "--corr", "0.9",
+        "--warmup", "0",
+    ]
+    rc = run_pred_1h.remote(args, log_subdir="math50_test_crash")
+    print(f"[math50_test_crash] returned {rc}")
+    print("[math50_test_crash] logs on volume:")
+    for p in ls_logs.remote("math50_test_crash"):
+        print(f"  {p}")
+
+
+@app.local_entrypoint()
+def math50_per_problem():
+    """Full MATH50 run, one problem per Python subprocess. Slower per problem
+    by ~30s but immune to the cross-problem state leak we hit. Same logging
+    as the standard math50 entrypoint."""
+    args = [
+        "--model", "ds-r1-llama-8b",
+        "--dataset", "MATH50",
+        "--max_gen", "16384",
+        "--budget", "2048",
+        "--sink", "512",
+        "--recent", "512",
+        "--recall_impl", "cuda_cpy",
+        "--spec_ret",
+        "--corr", "0.9",
+        "--warmup", "0",
+    ]
+    rc = run_pred_per_problem.remote(
+        args,
+        log_subdir="math50",
+        dataset_path="accuracy/eval/reasoning/datasets/math50.jsonl",
+        id_field="unique_id",
+    )
+    print(f"[math50_per_problem] returned {rc}")
+    print("[math50_per_problem] logs on volume:")
+    for p in ls_logs.remote("math50"):
         print(f"  {p}")
 
 

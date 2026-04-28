@@ -422,7 +422,11 @@ def main():
     # =================================================================
     report = []
     report.append("# `profile_aime` — systems profiling analysis\n")
-    report.append(f"Source: `{args.input_dir.relative_to(REPO_ROOT)}`\n")
+    try:
+        rel = args.input_dir.resolve().relative_to(REPO_ROOT)
+    except ValueError:
+        rel = args.input_dir
+    report.append(f"Source: `{rel}`\n")
     report.append(f"Problems: {sorted(per.keys())}\n")
 
     report.append("## Q1. How much longer does a step take when correction happens?\n")

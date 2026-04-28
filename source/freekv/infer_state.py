@@ -243,8 +243,14 @@ class InferState:
         self._recall_log_fh = None
         self._timing_log_fh = None
         self._tbt_log_fh = None
-        # _pending_timings: list of [step_id, layer, component, start_evt, end_evt, ended]
+        # _pending_timings: list of [step_id, layer, component, s_idx, e_idx, ended]
         self._pending_timings: list = []
+        # Reusable CUDA-event pool for timing — allocated once on first use,
+        # bounded so it never grows past a few hundred events regardless of
+        # how many problems / steps we run.
+        self._timer_pool = None
+        self._timer_free: list = []
+        self._timer_capacity = 0
         self._per_head_sim_buffer = None
         self._per_head_sim_tag = None
         # per-recalled-page byte size: 2 (K+V) * page_size * group_size * head_dim * itemsize
@@ -264,36 +270,71 @@ class InferState:
         if self.log_dir is not None and not hasattr(self, "last_step_q"):
             self.last_step_q = [None] * n_layers
 
+    def _ensure_timer_pool(self, capacity: int = 512):
+        """Lazy pre-allocate a fixed pool of CUDA events for timing.
+        Reusing a bounded pool avoids the millions of ad-hoc event allocations
+        that otherwise occur on long-running problems and cause CUDA driver
+        errors after thousands of steps."""
+        if getattr(self, "_timer_pool", None) is not None:
+            return
+        self._timer_pool = [
+            torch.cuda.Event(enable_timing=True) for _ in range(capacity)
+        ]
+        self._timer_free = list(range(capacity))
+        self._timer_capacity = capacity
+
+    def _acquire_event(self):
+        """Pop a free event index from the pool. Allocates ad-hoc and grows
+        the pool only if we ever exhaust it (degraded fallback)."""
+        pool = self._timer_pool
+        free = self._timer_free
+        if free:
+            idx = free.pop()
+            return idx, pool[idx]
+        # Pool exhausted — extend rather than fail. Should be rare with
+        # proper sizing (~6 components × 32 layers × 2 events = 384 needed).
+        idx = len(pool)
+        pool.append(torch.cuda.Event(enable_timing=True))
+        return idx, pool[idx]
+
+    def _release_event(self, idx: int):
+        if 0 <= idx < len(self._timer_pool):
+            self._timer_free.append(idx)
+
     def time_block_start(self, layer_idx: int, component: str):
         """Start a CUDA-event-based timer. Returns a handle to pass to
         time_block_end(). No-op (returns None) when timing isn't enabled."""
         if self._timing_log_fh is None:
             return None
-        s = torch.cuda.Event(enable_timing=True)
-        e = torch.cuda.Event(enable_timing=True)
-        s.record()
-        entry = [self.step_id, layer_idx, component, s, e, False]
+        self._ensure_timer_pool()
+        s_idx, s_evt = self._acquire_event()
+        e_idx, e_evt = self._acquire_event()
+        s_evt.record()
+        entry = [self.step_id, layer_idx, component, s_idx, e_idx, False]
         self._pending_timings.append(entry)
         return entry
 
     def time_block_end(self, handle):
         if handle is None:
             return
-        handle[4].record()  # end event
+        e_idx = handle[4]
+        self._timer_pool[e_idx].record()  # end event
         handle[5] = True
 
     def flush_step_timing(self):
-        """Drain completed timings to the CSV. Pending events that haven't
-        completed yet are kept and retried next call."""
+        """Drain completed timings to the CSV and release events back to the
+        pool. Pending (not-yet-ended) entries are kept for the next call."""
         if self._timing_log_fh is None or not self._pending_timings:
             return
         keep = []
+        pool = self._timer_pool
         for entry in self._pending_timings:
-            step_id, layer_id, component, s_evt, e_evt, ended = entry
+            step_id, layer_id, component, s_idx, e_idx, ended = entry
             if not ended:
                 keep.append(entry)
                 continue
-            # query() avoids a sync if the event isn't done; we'll retry later.
+            s_evt = pool[s_idx]
+            e_evt = pool[e_idx]
             try:
                 ready = e_evt.query()
             except Exception:
@@ -308,6 +349,9 @@ class InferState:
             self._timing_log_fh.write(
                 f"{step_id},{layer_id},{component},{us:.2f}\n"
             )
+            # Release both events back to the pool for reuse.
+            self._release_event(s_idx)
+            self._release_event(e_idx)
         self._pending_timings = keep
 
     def log_tbt(self, step_id: int, total_ms: float):
@@ -358,10 +402,15 @@ class InferState:
     def close_logs(self):
         # Drain any remaining timing rows (sync if needed).
         if getattr(self, "_pending_timings", None):
+            pool = getattr(self, "_timer_pool", None) or []
             for entry in self._pending_timings:
-                step_id, layer_id, component, s_evt, e_evt, ended = entry
+                step_id, layer_id, component, s_idx, e_idx, ended = entry
                 if not ended:
                     continue
+                if not pool:
+                    continue
+                s_evt = pool[s_idx]
+                e_evt = pool[e_idx]
                 try:
                     e_evt.synchronize()
                     us = s_evt.elapsed_time(e_evt) * 1000.0
@@ -371,6 +420,8 @@ class InferState:
                     self._timing_log_fh.write(
                         f"{step_id},{layer_id},{component},{us:.2f}\n"
                     )
+                self._release_event(s_idx)
+                self._release_event(e_idx)
             self._pending_timings = []
 
         for attr in (
