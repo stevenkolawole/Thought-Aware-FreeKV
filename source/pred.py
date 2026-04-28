@@ -89,7 +89,9 @@ def parse_args(args=None):
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--model", type=str, default=None, help="Model name (key in config/model2path.json)")
-    parser.add_argument("--dataset", type=str, required=True, choices=["AIME24", "gov_report", "lgbench"], help="Evaluation dataset to use")
+    parser.add_argument("--dataset", type=str, required=True,
+                        choices=["AIME24", "MATH50", "GPQA50c", "gov_report", "lgbench"],
+                        help="Evaluation dataset to use")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0 for greedy)")
     parser.add_argument("--max_length", type=int, default=32000, help="Max input token length (longer inputs are truncated from the middle)")
     parser.add_argument("--max_gen", type=int, default=8192, help="Max number of new tokens to generate")
@@ -194,7 +196,11 @@ def get_pred(
     preds = []
     for prob_idx, json_obj in enumerate(tqdm(data)):
         if infer_state is not None and infer_state.log_dir is not None:
-            tag = json_obj.get("id", f"prob{prob_idx}")
+            tag = (
+                json_obj.get("id")
+                or json_obj.get("unique_id")
+                or f"prob{prob_idx}"
+            )
             # filesystem-safe tag
             tag = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(tag))
             infer_state.open_logs(tag=tag, max_steps=max_gen)
@@ -256,7 +262,11 @@ def get_pred(
             pred_only_output = tokenizer.decode(output[b][len(input[b]):], skip_special_tokens=True)
             print(f"{BOLD}[Batch {b}] Output preview:{RESET} {simplify_text_preview(pred_only_output, max_tokens=100)}")
             pred_record = {
-                "id": json_obj.get("id"),
+                "id": (
+                    json_obj.get("id")
+                    or json_obj.get("unique_id")
+                    or f"prob{prob_idx}"
+                ),
                 "input:": prompt,
                 "pred": pred,
                 "answer": json_obj[answer_field_id] if answer_field_id is not None else "",
@@ -317,6 +327,18 @@ if __name__ == "__main__":
         prompt_cfg_path = "eval/o1/config/dataset2prompt.json"
         if not os.path.exists(prompt_cfg_path):
             prompt_cfg_path = "accuracy/eval/reasoning/config/dataset2prompt.json"
+        dataset2prompt = json.load(open(prompt_cfg_path, "r"))
+        prompt_format = dataset2prompt[dataset]
+    elif dataset == "MATH50":
+        answer_field_id = "answer"
+        ds_path = "accuracy/eval/reasoning/datasets/math50.jsonl"
+        prompt_cfg_path = "accuracy/eval/reasoning/config/dataset2prompt.json"
+        dataset2prompt = json.load(open(prompt_cfg_path, "r"))
+        prompt_format = dataset2prompt[dataset]
+    elif dataset == "GPQA50c":
+        answer_field_id = "answer"
+        ds_path = "accuracy/eval/reasoning/datasets/gpqa50c.jsonl"
+        prompt_cfg_path = "accuracy/eval/reasoning/config/dataset2prompt.json"
         dataset2prompt = json.load(open(prompt_cfg_path, "r"))
         prompt_format = dataset2prompt[dataset]
 

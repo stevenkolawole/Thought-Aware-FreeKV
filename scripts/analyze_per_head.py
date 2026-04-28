@@ -285,7 +285,8 @@ def main():
     # Global aggregate across all problems
     global_rows = []
     report = []
-    report.append("# `dips_v2` — per-head cosine-similarity analysis\n")
+    label = args.input_dir.parent.name if args.input_dir.parent.name != "modal_logs" else args.input_dir.name
+    report.append(f"# `{label}` — per-head cosine-similarity analysis\n")
     report.append(
         "Uses the full `[n_steps, n_layers=32, n_q_heads=32]` cosine-sim "
         "tensor cached per problem. This lets us compute any aggregation "

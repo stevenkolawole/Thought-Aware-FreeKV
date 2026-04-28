@@ -135,39 +135,43 @@ image = (
 )
 
 
-@app.function(
+_RUN_PRED_FN_KW = dict(
     image=image,
     gpu="A100-40GB",
     volumes={
         "/root/.cache/huggingface": hf_cache,
         "/logs": logs_vol,
     },
-    timeout=60 * 60 * 4,
     secrets=[modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])],
 )
-def run_pred(pred_args: list[str], log_subdir: str | None = None) -> int:
-    """Execute `python source/pred.py <pred_args>` inside the image.
 
-    Logs (if requested via --log_dir) are written into the `tafkv-logs`
-    Modal Volume so they persist across runs and can be downloaded locally.
-    """
+
+def _run_pred_impl(pred_args: list[str], log_subdir: str | None) -> int:
     import subprocess
-
     os.chdir(REMOTE_ROOT)
-
     cmd = ["python", "source/pred.py", *pred_args]
     if log_subdir:
         log_path = f"/logs/{log_subdir}"
         os.makedirs(log_path, exist_ok=True)
-        # Only inject --log_dir if the user didn't already pass one
         if not any(a == "--log_dir" for a in pred_args):
             cmd += ["--log_dir", log_path]
         print(f"[modal] instrumentation logs -> {log_path}")
-
     print(f"[modal] exec: {' '.join(cmd)}", flush=True)
     proc = subprocess.run(cmd)
     logs_vol.commit()
     return proc.returncode
+
+
+@app.function(timeout=60 * 60 * 12, **_RUN_PRED_FN_KW)
+def run_pred(pred_args: list[str], log_subdir: str | None = None) -> int:
+    """Default 12h timeout — for full benchmark sweeps."""
+    return _run_pred_impl(pred_args, log_subdir)
+
+
+@app.function(timeout=60 * 60, **_RUN_PRED_FN_KW)
+def run_pred_1h(pred_args: list[str], log_subdir: str | None = None) -> int:
+    """1h timeout — for short profiling/validation runs."""
+    return _run_pred_impl(pred_args, log_subdir)
 
 
 @app.function(
@@ -248,6 +252,96 @@ def smoke():
     print(f"[smoke] returned {rc}")
     print("[smoke] logs on volume:")
     for p in ls_logs.remote("smoke"):
+        print(f"  {p}")
+
+
+@app.local_entrypoint()
+def profile_aime():
+    """Systems-profiling run on 5 short AIME problems with full per-component
+    CUDA-event timing, per-step TBT log, and recall log with the
+    need_recall_corr mask applied (bytes_actual column).
+
+    Picked these 5 because they all terminated naturally <5K tokens in prior
+    runs, so every problem will get steady-state decode without hitting the
+    max_gen cap. Total expected wall ~30 min on A100-40GB.
+
+    Writes to log_subdir='profile_aime'.
+    """
+    problem_ids = [
+        "2024-II-4",   # ~3,292 gen tokens previously
+        "2024-I-1",    # ~3,008
+        "2024-I-3",    # ~3,749
+        "2024-I-6",    # ~2,510
+        "2024-II-12",  # ~4,202
+    ]
+    args = [
+        "--model", "ds-r1-llama-8b",
+        "--dataset", "AIME24",
+        "--max_gen", "16384",
+        "--data_ids", ",".join(problem_ids),
+        "--budget", "2048",
+        "--sink", "512",
+        "--recent", "512",
+        "--recall_impl", "cuda_cpy",
+        "--spec_ret",
+        "--corr", "0.9",
+        "--warmup", "0",
+    ]
+    # Use the 1h-timeout sibling so blast radius is bounded if anything hangs.
+    rc = run_pred_1h.remote(args, log_subdir="profile_aime")
+    print(f"[profile_aime] returned {rc}")
+    print("[profile_aime] logs on volume:")
+    for p in ls_logs.remote("profile_aime"):
+        print(f"  {p}")
+
+
+@app.local_entrypoint()
+def math50():
+    """Full MATH50 (49 problems) with the same FreeKV paper-config as full_aime:
+    max_gen=16384, sink=512, recent=512, corr=0.9. Per-head sim cached as npz.
+    Writes to log_subdir='math50'."""
+    args = [
+        "--model", "ds-r1-llama-8b",
+        "--dataset", "MATH50",
+        "--max_gen", "16384",
+        "--budget", "2048",
+        "--sink", "512",
+        "--recent", "512",
+        "--recall_impl", "cuda_cpy",
+        "--spec_ret",
+        "--corr", "0.9",
+        "--warmup", "0",
+    ]
+    rc = run_pred.remote(args, log_subdir="math50")
+    print(f"[math50] returned {rc}")
+    print("[math50] logs on volume:")
+    for p in ls_logs.remote("math50"):
+        print(f"  {p}")
+
+
+@app.local_entrypoint()
+def full_aime():
+    """Full AIME24 (all 30 problems) with FreeKV's paper-matched config:
+    max_gen=16384 (paper Section 5.2 says 16K), sink=512, recent=512, corr=0.9.
+    Writes to log_subdir='full_aime'. Includes per-head sim npz, tokens, and
+    incremental preds.jsonl per problem.
+    """
+    args = [
+        "--model", "ds-r1-llama-8b",
+        "--dataset", "AIME24",
+        "--max_gen", "16384",
+        "--budget", "2048",
+        "--sink", "512",
+        "--recent", "512",
+        "--recall_impl", "cuda_cpy",
+        "--spec_ret",
+        "--corr", "0.9",
+        "--warmup", "0",
+    ]
+    rc = run_pred.remote(args, log_subdir="full_aime")
+    print(f"[full_aime] returned {rc}")
+    print("[full_aime] logs on volume:")
+    for p in ls_logs.remote("full_aime"):
         print(f"  {p}")
 
 

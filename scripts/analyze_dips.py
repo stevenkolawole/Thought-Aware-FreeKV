@@ -372,7 +372,7 @@ def main():
     if by_q is not None:
         lines.append("- [p_transition_by_quintile.png](plots/p_transition_by_quintile.png)")
 
-    report_path = out_dir / "report.md"
+    report_path = out_dir / "dips_report.md"
     report_path.write_text("\n".join(lines))
     print(f"\nReport: {report_path}")
 

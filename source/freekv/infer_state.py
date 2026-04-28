@@ -241,6 +241,10 @@ class InferState:
         self.step_id = -1  # first decode step becomes 0
         self._corr_log_fh = None
         self._recall_log_fh = None
+        self._timing_log_fh = None
+        self._tbt_log_fh = None
+        # _pending_timings: list of [step_id, layer, component, start_evt, end_evt, ended]
+        self._pending_timings: list = []
         self._per_head_sim_buffer = None
         self._per_head_sim_tag = None
         # per-recalled-page byte size: 2 (K+V) * page_size * group_size * head_dim * itemsize
@@ -260,6 +264,57 @@ class InferState:
         if self.log_dir is not None and not hasattr(self, "last_step_q"):
             self.last_step_q = [None] * n_layers
 
+    def time_block_start(self, layer_idx: int, component: str):
+        """Start a CUDA-event-based timer. Returns a handle to pass to
+        time_block_end(). No-op (returns None) when timing isn't enabled."""
+        if self._timing_log_fh is None:
+            return None
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        entry = [self.step_id, layer_idx, component, s, e, False]
+        self._pending_timings.append(entry)
+        return entry
+
+    def time_block_end(self, handle):
+        if handle is None:
+            return
+        handle[4].record()  # end event
+        handle[5] = True
+
+    def flush_step_timing(self):
+        """Drain completed timings to the CSV. Pending events that haven't
+        completed yet are kept and retried next call."""
+        if self._timing_log_fh is None or not self._pending_timings:
+            return
+        keep = []
+        for entry in self._pending_timings:
+            step_id, layer_id, component, s_evt, e_evt, ended = entry
+            if not ended:
+                keep.append(entry)
+                continue
+            # query() avoids a sync if the event isn't done; we'll retry later.
+            try:
+                ready = e_evt.query()
+            except Exception:
+                ready = True
+            if not ready:
+                keep.append(entry)
+                continue
+            try:
+                us = s_evt.elapsed_time(e_evt) * 1000.0  # ms -> us
+            except Exception:
+                us = float("nan")
+            self._timing_log_fh.write(
+                f"{step_id},{layer_id},{component},{us:.2f}\n"
+            )
+        self._pending_timings = keep
+
+    def log_tbt(self, step_id: int, total_ms: float):
+        if self._tbt_log_fh is None:
+            return
+        self._tbt_log_fh.write(f"{step_id},{total_ms:.4f}\n")
+
     def open_logs(self, tag: str = "run", max_steps: int | None = None):
         """Open CSV log files + per-head sim buffer. Call at start of each problem.
 
@@ -274,10 +329,20 @@ class InferState:
         self.close_logs()
         corr_path = os.path.join(self.log_dir, f"corr_{tag}.csv")
         recall_path = os.path.join(self.log_dir, f"recall_{tag}.csv")
+        timing_path = os.path.join(self.log_dir, f"timing_{tag}.csv")
+        tbt_path = os.path.join(self.log_dir, f"tbt_{tag}.csv")
         self._corr_log_fh = open(corr_path, "w", buffering=1)
         self._recall_log_fh = open(recall_path, "w", buffering=1)
+        self._timing_log_fh = open(timing_path, "w", buffering=1)
+        self._tbt_log_fh = open(tbt_path, "w", buffering=1)
         self._corr_log_fh.write("step_id,layer_id,cos_sim,need_corr,thought_type,sim_ema\n")
-        self._recall_log_fh.write("step_id,layer_id,n_pages,bytes\n")
+        # bytes_actual reflects need_recall_corr masking (zero for non-drifted heads).
+        self._recall_log_fh.write(
+            "step_id,layer_id,n_pages,bytes,n_pages_actual,bytes_actual\n"
+        )
+        self._timing_log_fh.write("step_id,layer_id,component,us\n")
+        self._tbt_log_fh.write("step_id,total_ms\n")
+        self._pending_timings = []
 
         if max_steps is not None and max_steps > 0:
             import numpy as _np
@@ -291,7 +356,29 @@ class InferState:
             self._per_head_sim_tag = None
 
     def close_logs(self):
-        for attr in ("_corr_log_fh", "_recall_log_fh"):
+        # Drain any remaining timing rows (sync if needed).
+        if getattr(self, "_pending_timings", None):
+            for entry in self._pending_timings:
+                step_id, layer_id, component, s_evt, e_evt, ended = entry
+                if not ended:
+                    continue
+                try:
+                    e_evt.synchronize()
+                    us = s_evt.elapsed_time(e_evt) * 1000.0
+                except Exception:
+                    us = float("nan")
+                if self._timing_log_fh is not None:
+                    self._timing_log_fh.write(
+                        f"{step_id},{layer_id},{component},{us:.2f}\n"
+                    )
+            self._pending_timings = []
+
+        for attr in (
+            "_corr_log_fh",
+            "_recall_log_fh",
+            "_timing_log_fh",
+            "_tbt_log_fh",
+        ):
             fh = getattr(self, attr, None)
             if fh is not None:
                 try:
@@ -333,12 +420,17 @@ class InferState:
             f"{self.current_thought_type},{self.sim_ema:.6f}\n"
         )
 
-    def log_recall(self, layer_idx: int, n_pages: int):
+    def log_recall(self, layer_idx: int, n_pages: int,
+                   n_pages_actual: int | None = None):
         if self._recall_log_fh is None:
             return
-        bytes_transferred = int(n_pages) * self._recall_bytes_per_page
+        bytes_decided = int(n_pages) * self._recall_bytes_per_page
+        if n_pages_actual is None:
+            n_pages_actual = int(n_pages)
+        bytes_actual = int(n_pages_actual) * self._recall_bytes_per_page
         self._recall_log_fh.write(
-            f"{self.step_id},{layer_idx},{int(n_pages)},{bytes_transferred}\n"
+            f"{self.step_id},{layer_idx},{int(n_pages)},{bytes_decided},"
+            f"{int(n_pages_actual)},{bytes_actual}\n"
         )
 
     def update_thought_type(self, cos_sim: float) -> int:
@@ -653,8 +745,23 @@ class InferState:
         impl = self.recall_impl
 
         if self._recall_log_fh is not None:
-            total_pages = int(rids[:, :, 0].sum().item())
-            self.log_recall(layer_idx, total_pages)
+            page_counts = rids[:, :, 0]              # [bsz, n_groups]
+            total_pages = int(page_counts.sum().item())
+            # Apply need_recall_corr mask (per [bsz, n_kv_heads]) so we report
+            # the actual transfer, not the unmasked top-k diff. group_size==1
+            # in our standard config so kv-heads index 1:1 with groups.
+            n_pages_actual = total_pages
+            if (
+                need_recall_corr is not None
+                and hasattr(need_recall_corr, "numel")
+                and need_recall_corr.numel() > 0
+            ):
+                try:
+                    mask = need_recall_corr.to(page_counts.device).to(page_counts.dtype)
+                    n_pages_actual = int((page_counts * mask).sum().item())
+                except Exception:
+                    n_pages_actual = total_pages
+            self.log_recall(layer_idx, total_pages, n_pages_actual=n_pages_actual)
 
         torch.cuda.nvtx.range_push("recall")
         if impl == "arkvale":

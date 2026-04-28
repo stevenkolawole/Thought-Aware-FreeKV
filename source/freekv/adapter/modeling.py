@@ -96,6 +96,7 @@ def _freekv_attn_forward(
             state.begin_forward(bsz, q_len)
 
         torch.cuda.nvtx.range_push(f"qkv_proj")
+        _t_qkv_rope = state.time_block_start(cur_id, "qkv_rope")
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -133,6 +134,7 @@ def _freekv_attn_forward(
                 rope_theta=self.config.rope_theta,
             )
         torch.cuda.nvtx.range_pop()
+        state.time_block_end(_t_qkv_rope)
 
         if q_len > 1:
             kvc.prefill_alloc_n_tokens(q_len, state.alloc_page)
@@ -180,6 +182,7 @@ def _freekv_attn_forward(
                                 sim_cpu = sim_raw[0, 0].detach().float().cpu().numpy()
                             sim_mean_val = float(sim_cpu.mean())
                             state.log_per_head_sim(cur_id, sim_cpu)
+                        _t_cos = state.time_block_start(cur_id, "cos")
                         torch.cuda.nvtx.range_push("cos")
                         if FORCE_CORR_RATE is not None:
                             to_corr_src = _force_to_corr[:bsz, :self.num_key_value_heads]
@@ -216,6 +219,7 @@ def _freekv_attn_forward(
                                     to_corr = state.to_corr_cpu_pinned[:bsz]
                                     to_corr.copy_(to_corr_res, non_blocking=False)
                         torch.cuda.nvtx.range_pop()
+                        state.time_block_end(_t_cos)
                         state.corr_checks[cur_id] += 1
                         if need_corr:
                             state.corr_triggers[cur_id] += 1
@@ -224,13 +228,19 @@ def _freekv_attn_forward(
                                 state.update_thought_type(sim_mean_val)
                             state.log_corr(cur_id, sim_mean_val, need_corr)
                         if need_corr:
+                            _t_es = state.time_block_start(cur_id, "estimate_select")
                             eids, rids = state.estimate_select(cur_id, query_states)
+                            state.time_block_end(_t_es)
+                            _t_rs = state.time_block_start(cur_id, "recall_sync")
                             state.recall(cur_id, eids, rids, blocking=True, need_recall_corr=to_corr)
+                            state.time_block_end(_t_rs)
                         else:
                             to_corr = None
                         
                     torch.cuda.nvtx.range_push("Fwd")
+                    _t_attn = state.time_block_start(cur_id, "attn")
                     attn_output = state.decode_sdpa(cur_id, query_states, attn_page_ids)
+                    state.time_block_end(_t_attn)
                     torch.cuda.nvtx.range_pop()
                     recall_evt1, recall_evt2 = state.spec_ret_recall_events[cur_id]
                     state.spec_ret_recall_status[cur_id] = (recall_evt1, recall_evt2)
@@ -256,7 +266,9 @@ def _freekv_attn_forward(
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         torch.cuda.nvtx.range_push("oproj")
+        _t_oproj = state.time_block_start(cur_id, "oproj")
         attn_output = self.o_proj(attn_output)
+        state.time_block_end(_t_oproj)
         torch.cuda.nvtx.range_pop()
 
         if not output_attentions:
@@ -338,7 +350,13 @@ def enable_offload(
         infer_state.compute_stream.synchronize()
         ret["past_key_values"] = "dummy"
         ed = time.perf_counter()
-        self.tbt_stat_ms.append((ed-st)*1000)
+        total_ms = (ed - st) * 1000.0
+        self.tbt_stat_ms.append(total_ms)
+        # Per-step TBT + drain pending CUDA-event timings (now safe to query
+        # since we just synchronized compute_stream).
+        if infer_state.log_dir is not None:
+            infer_state.log_tbt(infer_state.step_id, total_ms)
+            infer_state.flush_step_timing()
         return ret
 
     self.tbt_stat_ms = []
