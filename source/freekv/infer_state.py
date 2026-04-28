@@ -44,6 +44,7 @@ class InferState:
         corr=None,
         corr_impl=None,
         corr_max_batch=16,
+        fetch_interval: int = 1,
         log_dir=None,
         thought_ema_alpha=0.1,
         thought_tau_r=0.84,
@@ -230,6 +231,8 @@ class InferState:
             self.last_step_q = [None] * n_layers
         else:
             self.compute_stream = self.default_stream
+
+        self.fetch_interval = max(1, int(fetch_interval))
 
         self.recall_stat_ms = []
         self.sel_stat_ms = []

@@ -158,6 +158,15 @@ def _run_pred_impl(pred_args: list[str], log_subdir: str | None) -> int:
         print(f"[modal] instrumentation logs -> {log_path}")
     print(f"[modal] exec: {' '.join(cmd)}", flush=True)
     proc = subprocess.run(cmd)
+    # Copy any JSONL predictions into the log volume so they survive container exit.
+    if log_subdir:
+        import glob, shutil
+        preds_dir = os.path.join(REMOTE_ROOT, "tmp_res")
+        for jsonl in glob.glob(os.path.join(preds_dir, "**", "*.jsonl"), recursive=True):
+            rel = os.path.relpath(jsonl, preds_dir)
+            dst = f"/logs/{log_subdir}/preds_{rel.replace(os.sep, '_')}"
+            shutil.copy(jsonl, dst)
+            print(f"[modal] predictions -> {dst}")
     logs_vol.commit()
     return proc.returncode
 
@@ -467,6 +476,49 @@ def smoke_instr():
     print(f"[smoke_instr] returned {rc}")
     print("[smoke_instr] logs on volume:")
     for p in ls_logs.remote("smoke_instr"):
+        print(f"  {p}")
+
+
+_MATH50_FETCH_BASE_ARGS = [
+    "--model", "ds-r1-llama-8b",
+    "--dataset", "MATH50",
+    "--max_gen", "8192",
+    "--budget", "2048",
+    "--sink", "512",
+    "--recent", "512",
+    "--recall_impl", "cuda_cpy",
+    "--spec_ret",
+    "--warmup", "0",
+]
+
+
+@app.local_entrypoint()
+def math50_fetch1():
+    """MATH50 with fetch_interval=1 (baseline: fetch every decode step)."""
+    args = _MATH50_FETCH_BASE_ARGS + ["--fetch_interval", "1"]
+    rc = run_pred.remote(args, log_subdir="math50_fetch1")
+    print(f"[math50_fetch1] returned {rc}")
+    for p in ls_logs.remote("math50_fetch1"):
+        print(f"  {p}")
+
+
+@app.local_entrypoint()
+def math50_fetch2():
+    """MATH50 with fetch_interval=2 (fetch every other decode step)."""
+    args = _MATH50_FETCH_BASE_ARGS + ["--fetch_interval", "2"]
+    rc = run_pred.remote(args, log_subdir="math50_fetch2")
+    print(f"[math50_fetch2] returned {rc}")
+    for p in ls_logs.remote("math50_fetch2"):
+        print(f"  {p}")
+
+
+@app.local_entrypoint()
+def math50_fetch8():
+    """MATH50 with fetch_interval=8 (fetch every 8th decode step)."""
+    args = _MATH50_FETCH_BASE_ARGS + ["--fetch_interval", "8"]
+    rc = run_pred.remote(args, log_subdir="math50_fetch8")
+    print(f"[math50_fetch8] returned {rc}")
+    for p in ls_logs.remote("math50_fetch8"):
         print(f"  {p}")
 
 

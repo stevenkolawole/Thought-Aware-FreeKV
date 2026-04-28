@@ -113,6 +113,7 @@ def parse_args(args=None):
     parser.add_argument("--corr", type=float, default=None, help="Correction threshold (cosine similarity); None to disable")
     parser.add_argument("--warmup", type=int, default=2, help="Number of warmup generation rounds before timing")
     parser.add_argument("--log_dir", type=str, default=None, help="Directory to write per-step instrumentation CSVs (corr_*.csv, recall_*.csv)")
+    parser.add_argument("--fetch_interval", type=int, default=1, help="Fetch KV pages from CPU every N decode steps (1 = every step, baseline)")
 
     return parser.parse_args(args)
 
@@ -160,6 +161,7 @@ def load_model_and_tokenizer(path):
             n_recall_stream=args.n_recall_stream,
             recall_impl=args.recall_impl,
             corr=args.corr,
+            fetch_interval=args.fetch_interval,
             log_dir=args.log_dir,
         )
     else:

@@ -156,108 +156,129 @@ def _freekv_attn_forward(
         else:
             attn_page_ids = kvc.c2p
             if budget is not None and kvc.n_pages > budget:
+                should_fetch = (
+                    state.fetch_interval <= 1
+                    or state.step_id % state.fetch_interval == 0
+                )
                 if state.spec_ret and cur_id not in NO_SPEC_RET_LAYER_SET:
-                    pending_events = state.spec_ret_recall_status[cur_id]
-                    if pending_events is not None:
-                        evt1, evt2 = pending_events
-                        state.compute_stream.wait_event(evt1)
-                        state.compute_stream.wait_event(evt2)
-                    else:
-                        # first decoding step, need a recall before attn
-                        state.estimate_select_recall(cur_id, query_states)
-                    
-                    to_corr = None
-                    if state.corr is not None and state.last_step_q[cur_id] is not None:
-                        sim_mean_val = None
-                        if state.log_dir is not None:
-                            with torch.no_grad():
-                                # sim_raw: [bsz, q_len=1, n_q_heads]
-                                sim_raw = F.cosine_similarity(
-                                    state.last_step_q[cur_id], query_states, dim=-1
-                                )
-                                # One GPU->CPU transfer: reuse for scalar
-                                # mean log AND per-head sim cache. Cast to
-                                # float32 first — model tensors are bf16
-                                # and numpy has no native bf16 dtype.
-                                sim_cpu = sim_raw[0, 0].detach().float().cpu().numpy()
-                            sim_mean_val = float(sim_cpu.mean())
-                            state.log_per_head_sim(cur_id, sim_cpu)
-                        _t_cos = state.time_block_start(cur_id, "cos")
-                        torch.cuda.nvtx.range_push("cos")
-                        if FORCE_CORR_RATE is not None:
-                            to_corr_src = _force_to_corr[:bsz, :self.num_key_value_heads]
-                            to_corr_gpu = state.to_corr_gpu[:bsz]
-                            to_corr_gpu.copy_(to_corr_src, non_blocking=False)
-                            state.need_corr_gpu.copy_(torch.any(to_corr_gpu))
-                            need_corr = bool(state.need_corr_gpu.item())
-                            if need_corr:
-                                to_corr = state.to_corr_cpu_pinned[:bsz]
-                                to_corr.copy_(to_corr_gpu, non_blocking=False)
+                    if should_fetch:
+                        pending_events = state.spec_ret_recall_status[cur_id]
+                        if pending_events is not None:
+                            evt1, evt2 = pending_events
+                            state.compute_stream.wait_event(evt1)
+                            state.compute_stream.wait_event(evt2)
                         else:
-                            if cur_id in ALWAYS_CORR_LAYER_SET:
-                                need_corr = True
-                                to_corr = state.to_corr_cpu_pinned[:bsz]
-                                to_corr.fill_(True)
-                            elif state.corr_impl == "managed_cuda":
-                                to_corr = state.to_corr_managed[:bsz]
-                                need_corr = kernels.get_corr_managed_cuda(
-                                    query_states,
-                                    state.last_step_q[cur_id],
-                                    self.num_key_value_heads,
-                                    state.corr,
-                                    to_corr,
-                                )   # sync inside the kernel
-                            else:
-                                to_corr_res, need_corr_res = get_corr_torch_compile(
-                                    query_states,
-                                    state.last_step_q[cur_id],
-                                    self.num_key_value_heads,
-                                    state.corr,
-                                )
-                                need_corr = bool(need_corr_res.item())
+                            # first decoding step or after skipped steps, need a recall before attn
+                            state.estimate_select_recall(cur_id, query_states)
+
+                        to_corr = None
+                        if state.corr is not None and state.last_step_q[cur_id] is not None:
+                            sim_mean_val = None
+                            if state.log_dir is not None:
+                                with torch.no_grad():
+                                    # sim_raw: [bsz, q_len=1, n_q_heads]
+                                    sim_raw = F.cosine_similarity(
+                                        state.last_step_q[cur_id], query_states, dim=-1
+                                    )
+                                    # One GPU->CPU transfer: reuse for scalar
+                                    # mean log AND per-head sim cache. Cast to
+                                    # float32 first — model tensors are bf16
+                                    # and numpy has no native bf16 dtype.
+                                    sim_cpu = sim_raw[0, 0].detach().float().cpu().numpy()
+                                sim_mean_val = float(sim_cpu.mean())
+                                state.log_per_head_sim(cur_id, sim_cpu)
+                            _t_cos = state.time_block_start(cur_id, "cos")
+                            torch.cuda.nvtx.range_push("cos")
+                            if FORCE_CORR_RATE is not None:
+                                to_corr_src = _force_to_corr[:bsz, :self.num_key_value_heads]
+                                to_corr_gpu = state.to_corr_gpu[:bsz]
+                                to_corr_gpu.copy_(to_corr_src, non_blocking=False)
+                                state.need_corr_gpu.copy_(torch.any(to_corr_gpu))
+                                need_corr = bool(state.need_corr_gpu.item())
                                 if need_corr:
                                     to_corr = state.to_corr_cpu_pinned[:bsz]
-                                    to_corr.copy_(to_corr_res, non_blocking=False)
-                        torch.cuda.nvtx.range_pop()
-                        state.time_block_end(_t_cos)
-                        state.corr_checks[cur_id] += 1
-                        if need_corr:
-                            state.corr_triggers[cur_id] += 1
-                        if state.log_dir is not None and sim_mean_val is not None:
-                            if cur_id == 0:
-                                state.update_thought_type(sim_mean_val)
-                            state.log_corr(cur_id, sim_mean_val, need_corr)
-                        if need_corr:
-                            _t_es = state.time_block_start(cur_id, "estimate_select")
-                            eids, rids = state.estimate_select(cur_id, query_states)
-                            state.time_block_end(_t_es)
-                            _t_rs = state.time_block_start(cur_id, "recall_sync")
-                            state.recall(cur_id, eids, rids, blocking=True, need_recall_corr=to_corr)
-                            state.time_block_end(_t_rs)
-                        else:
-                            to_corr = None
-                        
-                    torch.cuda.nvtx.range_push("Fwd")
-                    _t_attn = state.time_block_start(cur_id, "attn")
-                    attn_output = state.decode_sdpa(cur_id, query_states, attn_page_ids)
-                    state.time_block_end(_t_attn)
-                    torch.cuda.nvtx.range_pop()
-                    recall_evt1, recall_evt2 = state.spec_ret_recall_events[cur_id]
-                    state.spec_ret_recall_status[cur_id] = (recall_evt1, recall_evt2)
-                    if state.corr is None or to_corr is None:
-                        # not enable or not need correction
-                        state.estimate_select_recall_pool(cur_id, query_states, 
-                                                          recall_evt1, recall_evt2)
-                    else:
-                        # we have got eids and rids
-                        state.recall(cur_id, eids, rids, blocking=False, 
-                                     recall_evt1=recall_evt1, recall_evt2=recall_evt2,
-                                     need_recall_corr=to_corr)
+                                    to_corr.copy_(to_corr_gpu, non_blocking=False)
+                            else:
+                                if cur_id in ALWAYS_CORR_LAYER_SET:
+                                    need_corr = True
+                                    to_corr = state.to_corr_cpu_pinned[:bsz]
+                                    to_corr.fill_(True)
+                                elif state.corr_impl == "managed_cuda":
+                                    to_corr = state.to_corr_managed[:bsz]
+                                    need_corr = kernels.get_corr_managed_cuda(
+                                        query_states,
+                                        state.last_step_q[cur_id],
+                                        self.num_key_value_heads,
+                                        state.corr,
+                                        to_corr,
+                                    )   # sync inside the kernel
+                                else:
+                                    to_corr_res, need_corr_res = get_corr_torch_compile(
+                                        query_states,
+                                        state.last_step_q[cur_id],
+                                        self.num_key_value_heads,
+                                        state.corr,
+                                    )
+                                    need_corr = bool(need_corr_res.item())
+                                    if need_corr:
+                                        to_corr = state.to_corr_cpu_pinned[:bsz]
+                                        to_corr.copy_(to_corr_res, non_blocking=False)
+                            torch.cuda.nvtx.range_pop()
+                            state.time_block_end(_t_cos)
+                            state.corr_checks[cur_id] += 1
+                            if need_corr:
+                                state.corr_triggers[cur_id] += 1
+                            if state.log_dir is not None and sim_mean_val is not None:
+                                if cur_id == 0:
+                                    state.update_thought_type(sim_mean_val)
+                                state.log_corr(cur_id, sim_mean_val, need_corr)
+                            if need_corr:
+                                _t_es = state.time_block_start(cur_id, "estimate_select")
+                                eids, rids = state.estimate_select(cur_id, query_states)
+                                state.time_block_end(_t_es)
+                                _t_rs = state.time_block_start(cur_id, "recall_sync")
+                                state.recall(cur_id, eids, rids, blocking=True, need_recall_corr=to_corr)
+                                state.time_block_end(_t_rs)
+                            else:
+                                to_corr = None
 
-                    if state.corr is not None:
-                        state.last_step_q[cur_id] = query_states
+                        torch.cuda.nvtx.range_push("Fwd")
+                        _t_attn = state.time_block_start(cur_id, "attn")
+                        attn_output = state.decode_sdpa(cur_id, query_states, attn_page_ids)
+                        state.time_block_end(_t_attn)
+                        torch.cuda.nvtx.range_pop()
+                        recall_evt1, recall_evt2 = state.spec_ret_recall_events[cur_id]
+                        state.spec_ret_recall_status[cur_id] = (recall_evt1, recall_evt2)
+                        if state.corr is None or to_corr is None:
+                            # not enable or not need correction
+                            state.estimate_select_recall_pool(cur_id, query_states,
+                                                              recall_evt1, recall_evt2)
+                        else:
+                            # we have got eids and rids
+                            state.recall(cur_id, eids, rids, blocking=False,
+                                         recall_evt1=recall_evt1, recall_evt2=recall_evt2,
+                                         need_recall_corr=to_corr)
+
+                        if state.corr is not None:
+                            state.last_step_q[cur_id] = query_states
+                    else:
+                        # Skip fetch: wait for any pending recall to avoid a race condition,
+                        # then attend with the settled page layout from the last fetch step.
+                        # Reset status so the next fetch step triggers a sync recall.
+                        pending_events = state.spec_ret_recall_status[cur_id]
+                        if pending_events is not None:
+                            evt1, evt2 = pending_events
+                            state.compute_stream.wait_event(evt1)
+                            state.compute_stream.wait_event(evt2)
+                            state.spec_ret_recall_status[cur_id] = None
+                        torch.cuda.nvtx.range_push("Fwd")
+                        _t_attn = state.time_block_start(cur_id, "attn")
+                        attn_output = state.decode_sdpa(cur_id, query_states, attn_page_ids)
+                        state.time_block_end(_t_attn)
+                        torch.cuda.nvtx.range_pop()
                 else:
-                    state.estimate_select_recall(cur_id, query_states)
+                    if should_fetch:
+                        state.estimate_select_recall(cur_id, query_states)
                     attn_output = state.decode_sdpa(cur_id, query_states, attn_page_ids)
             else:
                 # not reach the budget
