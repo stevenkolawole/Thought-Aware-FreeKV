@@ -1,4 +1,4 @@
-"""Compare fetch_interval={1,2,8} runs on MATH50.
+"""Compare fetch_interval={1,4} runs on AIME
 
 Inputs (after `modal volume get tafkv-logs <subdir>/ results/<subdir>/`):
   results/math50_fetch1/tbt_<pid>.csv
@@ -22,15 +22,15 @@ import json
 import re
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
+MAX_TOKENS = 16384
 RUNS = {
-    "F=1 (baseline)": "math50_fetch1",
-    "F=2":            "math50_fetch2",
-    "F=8":            "math50_fetch8",
+    "F=1 (baseline)": "aime_debug_fetch1",
+    "F=4":            "aime_debug_fetch4",
 }
 
 BOXED = re.compile(r"\\boxed\s*\{((?:[^{}]|\{[^{}]*\})*)\}")
@@ -74,7 +74,7 @@ def grade_preds(preds_path: Path) -> pd.DataFrame:
                 "extracted": extracted,
                 "correct": correct,
                 "gen_tokens": gen_tokens,
-                "hit_cap": gen_tokens is not None and gen_tokens >= (8192 - 4),
+                "hit_cap": gen_tokens is not None and gen_tokens >= (MAX_TOKENS - 4),
             })
     return pd.DataFrame(rows)
 
@@ -87,10 +87,17 @@ def load_tbt(run_dir: Path) -> pd.DataFrame:
     """Load all tbt_<pid>.csv files and return a long-form DataFrame."""
     rows = []
     for f in sorted(run_dir.glob("tbt_*.csv")):
-        pid = f.stem.removeprefix("tbt_")
-        df = pd.read_csv(f)
-        df["pid"] = pid
-        rows.append(df)
+        try:
+            # Handle potentially empty or corrupted CSVs safely
+            df = pd.read_csv(f)
+            if df.empty:
+                continue
+            pid = f.stem.removeprefix("tbt_")
+            df["pid"] = pid
+            rows.append(df)
+        except pd.errors.EmptyDataError:
+            continue
+            
     if not rows:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
@@ -117,6 +124,69 @@ def latency_summary(tbt: pd.DataFrame) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def plot_tbt_distribution(
+    run_tbts: dict[str, pd.DataFrame],
+    out_path: Path,
+    shared_acc: dict[str, tuple[int, int]] | None = None,
+) -> None:
+    """Plot per-token latency distribution for each run, with mean annotated.
+
+    shared_acc: maps run label -> (n_correct, n_shared) on the intersected problem set.
+    """
+    n_runs = len(run_tbts)
+    if n_runs == 0:
+        return
+
+    fig, axes = plt.subplots(1, n_runs, figsize=(7 * n_runs, 5), squeeze=False)
+    colors = ["steelblue", "darkorange", "seagreen", "crimson"]
+
+    baseline_mean: float | None = None
+    for ax, (label, tbt), color in zip(axes[0], run_tbts.items(), colors):
+        # Generation tokens only (step_id >= 0); step_id == -1 is the prefill decode step
+        gen = tbt[tbt["step_id"] >= 0]["total_ms"].dropna()
+        mean_ms = gen.mean()
+        p95_ms = gen.quantile(0.95)
+
+        if baseline_mean is None:
+            baseline_mean = mean_ms
+
+        ax.hist(gen, bins=80, range=(0, p95_ms * 1.1), color=color,
+                alpha=0.75, edgecolor="white", linewidth=0.3, density=True,
+                label="per-token latency")
+        ax.axvline(mean_ms, color="black", linewidth=1.8, linestyle="--",
+                   label=f"mean = {mean_ms:.1f} ms")
+
+        annotation_lines = []
+        if mean_ms != baseline_mean:
+            speedup = baseline_mean / mean_ms
+            annotation_lines.append(f"{speedup:.2f}× faster than baseline")
+        if shared_acc and label in shared_acc:
+            n_correct, n_shared = shared_acc[label]
+            annotation_lines.append(f"acc = {n_correct}/{n_shared} ({n_correct/n_shared:.1%}) on shared")
+        if annotation_lines:
+            ax.text(0.97, 0.95, "\n".join(annotation_lines),
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=10, color="black",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow",
+                              edgecolor="gray", alpha=0.85))
+
+        ax.set_title(label, fontsize=12, fontweight="bold")
+        ax.set_xlabel("Time per token (ms)", fontsize=11)
+        ax.set_ylabel("Density", fontsize=11)
+        ax.legend(fontsize=10)
+        ax.spines[["top", "right"]].set_visible(False)
+
+    fig.suptitle("Token Generation Latency Distribution w/ Less Fetching", fontsize=14, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Distribution plot saved to {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -132,6 +202,8 @@ def main():
 
     latency_rows = []
     accuracy_rows = []
+    run_tbts: dict[str, pd.DataFrame] = {}
+    run_grades: dict[str, pd.DataFrame] = {}
 
     for label, subdir in RUNS.items():
         run_dir = results_dir / subdir
@@ -141,12 +213,14 @@ def main():
 
         # --- latency ---
         tbt = load_tbt(run_dir)
+        if not tbt.empty:
+            run_tbts[label] = tbt
         lat = latency_summary(tbt)
         if lat:
             latency_rows.append({"run": label, **lat})
 
         # --- accuracy ---
-        preds_files = list(run_dir.glob("preds_*.jsonl"))
+        preds_files = list(run_dir.glob("preds_*.jsonl")) or list(run_dir.glob("preds.jsonl"))
         if not preds_files:
             print(f"[warn] no preds file found in {run_dir}")
             continue
@@ -155,6 +229,7 @@ def main():
         if grades.empty:
             print(f"[warn] empty preds in {preds_path}")
             continue
+        run_grades[label] = grades
         n = len(grades)
         n_correct = int(grades["correct"].sum())
         n_extracted = int(grades["extracted"].notna().sum())
@@ -220,20 +295,55 @@ def main():
 
     if accuracy_rows:
         acc_df = pd.DataFrame(accuracy_rows).set_index("run")
-        print("\nAccuracy:")
+        print("\nAccuracy (all finished problems per run):")
         print(acc_df[["problems", "correct", "accuracy",
                        "no_extract", "hit_cap"]].to_string())
 
+    # Accuracy on shared problems only
+    if len(run_grades) > 1:
+        shared_ids = set.intersection(*(set(g["id"]) for g in run_grades.values()))
+        print(f"\nAccuracy on shared problems only ({len(shared_ids)} problems finished in all runs):")
+        shared_rows = []
+        for run_label, grades in run_grades.items():
+            g = grades[grades["id"].isin(shared_ids)]
+            n = len(g)
+            n_correct = int(g["correct"].sum())
+            shared_rows.append({
+                "run": run_label,
+                "shared_problems": n,
+                "correct": n_correct,
+                "accuracy": f"{n_correct/n:.1%}" if n else "N/A",
+            })
+        shared_df = pd.DataFrame(shared_rows).set_index("run")
+        print(shared_df.to_string())
+
     # Latency speedup relative to F=1
     if latency_rows and len(latency_rows) > 1:
-        baseline_mean = latency_rows[0]["mean_total_s"]
-        baseline_tbt  = latency_rows[0]["mean_tbt_ms"]
-        print("\nSpeedup vs F=1 baseline:")
-        for row in latency_rows:
-            sp_tot = baseline_mean / row["mean_total_s"] if row["mean_total_s"] else float("nan")
-            sp_tbt = baseline_tbt  / row["mean_tbt_ms"]  if row["mean_tbt_ms"]  else float("nan")
-            print(f"  {row['run']:20s}  total_latency: {sp_tot:.3f}x  "
-                  f"mean_tbt: {sp_tbt:.3f}x")
+        # Explicitly find the baseline run rather than relying on index 0
+        baseline_row = next((r for r in latency_rows if "baseline" in r["run"]), None)
+        
+        if baseline_row:
+            baseline_mean = baseline_row["mean_total_s"]
+            baseline_tbt  = baseline_row["mean_tbt_ms"]
+            print("\nSpeedup vs F=1 baseline:")
+            for row in latency_rows:
+                sp_tot = baseline_mean / row["mean_total_s"] if row["mean_total_s"] else float("nan")
+                sp_tbt = baseline_tbt  / row["mean_tbt_ms"]  if row["mean_tbt_ms"]  else float("nan")
+                print(f"  {row['run']:20s}  total_latency: {sp_tot:.3f}x  "
+                      f"mean_tbt: {sp_tbt:.3f}x")
+        else:
+            print("\n[warn] Baseline (F=1) missing, skipping speedup calculation.")
+
+    # Distribution plot
+    if run_tbts:
+        shared_acc: dict[str, tuple[int, int]] = {}
+        if len(run_grades) > 1:
+            shared_ids = set.intersection(*(set(g["id"]) for g in run_grades.values()))
+            for run_label, grades in run_grades.items():
+                g = grades[grades["id"].isin(shared_ids)]
+                shared_acc[run_label] = (int(g["correct"].sum()), len(g))
+        plot_tbt_distribution(run_tbts, results_dir / "tbt_distribution.png",
+                              shared_acc=shared_acc or None)
 
     # Save markdown summary
     out_path = results_dir / "fetch_interval_analysis.md"
@@ -249,6 +359,9 @@ def main():
         lines.append(acc_df[["problems", "correct", "accuracy",
                               "no_extract", "hit_cap"]].to_markdown())
         lines.append("\n")
+    
+    # Ensure directory exists before writing
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines))
     print(f"\nSummary saved to {out_path}")
 

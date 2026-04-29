@@ -164,12 +164,16 @@ def _freekv_attn_forward(
                     if should_fetch:
                         pending_events = state.spec_ret_recall_status[cur_id]
                         if pending_events is not None:
+                            _t_wait = state.time_block_start(cur_id, "recall_wait")
                             evt1, evt2 = pending_events
                             state.compute_stream.wait_event(evt1)
                             state.compute_stream.wait_event(evt2)
+                            state.time_block_end(_t_wait)
                         else:
                             # first decoding step or after skipped steps, need a recall before attn
+                            _t_sync_recall = state.time_block_start(cur_id, "recall_sync")
                             state.estimate_select_recall(cur_id, query_states)
+                            state.time_block_end(_t_sync_recall)
 
                         to_corr = None
                         if state.corr is not None and state.last_step_q[cur_id] is not None:
@@ -251,8 +255,10 @@ def _freekv_attn_forward(
                         state.spec_ret_recall_status[cur_id] = (recall_evt1, recall_evt2)
                         if state.corr is None or to_corr is None:
                             # not enable or not need correction
+                            _t_async_recall = state.time_block_start(cur_id, "recall_launch")
                             state.estimate_select_recall_pool(cur_id, query_states,
                                                               recall_evt1, recall_evt2)
+                            state.time_block_end(_t_async_recall)
                         else:
                             # we have got eids and rids
                             state.recall(cur_id, eids, rids, blocking=False,

@@ -484,9 +484,9 @@ _MATH50_FETCH_BASE_ARGS = [
     "--model", "ds-r1-llama-8b",
     "--dataset", "MATH50",
     "--max_gen", "8192",
-    "--budget", "2048",
-    "--sink", "512",
-    "--recent", "512",
+    "--budget", "512",
+    "--sink", "128",
+    "--recent", "128",
     "--page_size", "16",
     "--recall_impl", "cuda_cpy",
     "--spec_ret",
@@ -515,12 +515,56 @@ def math50_fetch2():
 
 
 @app.local_entrypoint()
+def math50_fetch4():
+    """MATH50 with fetch_interval=4 (fetch every 4th decode step)."""
+    args = _MATH50_FETCH_BASE_ARGS + ["--fetch_interval", "4"]
+    rc = run_pred.remote(args, log_subdir="math50_fetch4")
+    print(f"[math50_fetch4] returned {rc}")
+    for p in ls_logs.remote("math50_fetch4"):
+        print(f"  {p}")
+
+
+@app.local_entrypoint()
 def math50_fetch8():
     """MATH50 with fetch_interval=8 (fetch every 8th decode step)."""
     args = _MATH50_FETCH_BASE_ARGS + ["--fetch_interval", "8"]
     rc = run_pred.remote(args, log_subdir="math50_fetch8")
     print(f"[math50_fetch8] returned {rc}")
     for p in ls_logs.remote("math50_fetch8"):
+        print(f"  {p}")
+
+
+_AIME_FETCH_DEBUG_ARGS = [
+    "--model", "ds-r1-llama-8b",
+    "--dataset", "AIME24",
+    "--max_gen", "16384",
+    "--budget", "2048",
+    "--sink", "512",
+    "--recent", "512",
+    "--recall_impl", "cuda_cpy",
+    "--spec_ret",
+    "--corr", "0.9",
+    "--warmup", "0",
+]
+
+
+@app.local_entrypoint()
+def aime_debug_fetch1():
+    """AIME24 (all 30 problems), fetch_interval=1 — fetch baseline, paper-matched config."""
+    args = _AIME_FETCH_DEBUG_ARGS + ["--fetch_interval", "1"]
+    rc = run_pred.remote(args, log_subdir="aime_debug_fetch1")
+    print(f"[aime_debug_fetch1] returned {rc}")
+    for p in ls_logs.remote("aime_debug_fetch1"):
+        print(f"  {p}")
+
+
+@app.local_entrypoint()
+def aime_debug_fetch4():
+    """AIME24 (all 30 problems), fetch_interval=4 — fetch experiment, paper-matched config."""
+    args = _AIME_FETCH_DEBUG_ARGS + ["--fetch_interval", "4"]
+    rc = run_pred.remote(args, log_subdir="aime_debug_fetch4")
+    print(f"[aime_debug_fetch4] returned {rc}")
+    for p in ls_logs.remote("aime_debug_fetch4"):
         print(f"  {p}")
 
 
