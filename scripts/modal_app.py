@@ -112,7 +112,8 @@ image = (
         # apt's cmake (3.22) is too old for the freekv_cpp CMakeLists
         # (needs 3.26.4+); pip wheel ships a recent version.
         "pip install 'cmake>=3.26.4'",
-        f"cd {REMOTE_ROOT}/source && pip install -e . --no-build-isolation",
+        # MAX_JOBS=2 caps parallel nvcc threads to avoid OOM on Modal's builder.
+        f"cd {REMOTE_ROOT}/source && MAX_JOBS=2 pip install -e . --no-build-isolation",
     )
     # Runtime overlays: Python edits do not invalidate the baked layers.
     .add_local_dir(
@@ -486,6 +487,7 @@ _MATH50_FETCH_BASE_ARGS = [
     "--budget", "2048",
     "--sink", "512",
     "--recent", "512",
+    "--page_size", "16",
     "--recall_impl", "cuda_cpy",
     "--spec_ret",
     "--warmup", "0",

@@ -264,7 +264,6 @@ def _freekv_attn_forward(
                     else:
                         # Skip fetch: wait for any pending recall to avoid a race condition,
                         # then attend with the settled page layout from the last fetch step.
-                        # Reset status so the next fetch step triggers a sync recall.
                         pending_events = state.spec_ret_recall_status[cur_id]
                         if pending_events is not None:
                             evt1, evt2 = pending_events
@@ -276,6 +275,20 @@ def _freekv_attn_forward(
                         attn_output = state.decode_sdpa(cur_id, query_states, attn_page_ids)
                         state.time_block_end(_t_attn)
                         torch.cuda.nvtx.range_pop()
+                        # If the next step is a fetch step, launch the speculative async recall
+                        # now so it can overlap with this step's remaining compute. Without this,
+                        # the re-fetch step finds pending_events=None and must do a blocking sync
+                        # recall, destroying the overlap benefit spec_ret provides.
+                        next_is_fetch = (
+                            state.fetch_interval > 1
+                            and (state.step_id + 1) % state.fetch_interval == 0
+                        )
+                        if next_is_fetch:
+                            recall_evt1, recall_evt2 = state.spec_ret_recall_events[cur_id]
+                            state.spec_ret_recall_status[cur_id] = (recall_evt1, recall_evt2)
+                            state.estimate_select_recall_pool(
+                                cur_id, query_states, recall_evt1, recall_evt2
+                            )
                 else:
                     if should_fetch:
                         state.estimate_select_recall(cur_id, query_states)

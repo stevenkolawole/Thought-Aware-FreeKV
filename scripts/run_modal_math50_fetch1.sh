@@ -10,11 +10,11 @@ LOG_FILE="$REPO_ROOT/output.log"
 
 cd "$REPO_ROOT"
 {
-  echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) modal math50_fetch1 =====";
+  echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) modal math50_fetch1_v2 =====";
   echo "modal:  $MODAL";
   echo "app:    scripts/modal_app.py";
   "$MODAL" run --detach scripts/modal_app.py::math50_fetch1;
   rc=$?;
-  echo "===== math50_fetch1 exit=$rc =====";
+  echo "===== math50_fetch1_v2 exit=$rc =====";
   exit $rc;
 } 2>&1 | tee -a "$LOG_FILE"
